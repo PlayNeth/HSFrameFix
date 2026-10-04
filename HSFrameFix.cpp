@@ -20,6 +20,19 @@
 // What this ASI does:
 //  - preciseTicks: drives the 128 Hz chain from a QPC-based scheduler so tick
 //    times are exact (the original uses 1 ms GetTickCount one-shots).
+//  - v0.2: frames are placed on a smoothed simulation clock (follows when steps
+//    arrive, averaged) with a 4-snapshot history, and on a smoothed frame clock,
+//    instead of mapping steps to the 64 Hz counter (that mapping shifted by a
+//    whole step now and then, which showed as flicker/hitches).
+//  - v0.3: camera cuts (switching camera, look back/left/right [0x661968],
+//    jumps too large to blend) draw the frame at the newest step instead of
+//    mixing a newest camera with blended cars (jolt when pressing look back).
+//  - v0.4: menus. Every front-end screen presents through 0x538170: flush,
+//    page flip, then it spins until the 128 Hz tick counter [0x9E6D54] has
+//    advanced by 2 (= 64 fps cap), calling the idle work 0x526460 meanwhile.
+//    unlockMenus replaces that wait with one idle call per frame (plus the
+//    optional limiter), so menus run at the display's refresh rate. Menu
+//    animations are driven by the tick counter, so their speed is unchanged.
 //  - interpolate: after every sim step it snapshots the transforms of all cars
 //    (pos car+8, rotation car+0x34), all camera objects (pos cam+0x14,
 //    rotation cam+0x2C, table 0x660DF0) and the helicopter (position). Before
@@ -44,7 +57,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.1"
+#define HSFF_VERSION "0.4"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -75,6 +88,10 @@ namespace hs {
     const DWORD pCamTable       = 0x660DF0;   // Camera*[32 types][2 views]
     const DWORD pCamActive      = 0x661950;   // Camera*[2]
     const DWORD pCamOverride    = 0x661958;   // Camera*[2]
+    const DWORD pLookMode       = 0x661968;   // int[2]: 0 ahead, 1 back, 2/3 sides
+    // front end
+    const DWORD menuWaitAt      = 0x538185;   // mov eax,[0x9E6D54] - start of the 2-tick wait
+    const DWORD menuWaitDone    = 0x5381A9;   // mov eax,[ebp-8] - after the wait
     const DWORD pCopterCount    = 0x681DD8;
     const DWORD pCopterList     = 0x681DD4;
 
@@ -109,6 +126,10 @@ namespace hs {
         { 0x43C315, "\x8B\x80\x50\x19\x66\x00", 6 },                          // active camera
         { 0x50FDC1, "\x3B\x05\xD8\x1D\x68\x00", 6 },                          // copter count
         { 0x50FDCF, "\x8B\x04\x85\xD4\x1D\x68\x00", 7 },                      // copter list
+        { 0x4416E2, "\x89\x1C\x85\x68\x19\x66\x00", 7 },                      // look mode
+        { 0x538179, "\xFF\x15\xF0\x7F\x9E\x00\xFF\x15\xE0\x7F\x9E\x00\xA1\x54\x6D\x9E\x00"
+                    "\x89\x45\xF8\xA1\xBC\xA5\x8A\x00\x83\xC0\x02\x3B\x45\xF8\x7E\x0F"
+                    "\xA1\x54\x6D\x9E\x00\x89\x45\xF8\xE8\xB9\xE2\xFE\xFF\xEB\xE4\x8B\x45\xF8", 51 }, // menu present + wait
     };
 }
 
@@ -122,6 +143,9 @@ struct Config {
     int   targetFPS        = 0;     // 0 = no limiter (use vsync)
     float maxStepDistance  = 10.0f; // metres per sim step; larger jumps are not blended
     float maxStepAngle     = 90.0f; // degrees per sim step
+    float interpDelay      = 1.0f;  // how far behind the newest step frames are shown (steps)
+    int   unlockMenus      = 1;
+    int   menuTargetFPS    = -1;    // -1 = same as targetFPS, 0 = off
     int   logToFile        = 1;
     int   logEverySeconds  = 10;
 };
@@ -161,6 +185,13 @@ static void LoadConfig() {
                   "; don't blend jumps bigger than this per 1/64 s step (resets, teleports, camera cuts)\n"
                   "maxStepDistance=10\n"
                   "maxStepAngle=90\n"
+                  "; how many 1/64 s steps behind the newest simulation step frames are drawn\n"
+                  "; (1.0 = smooth with the least delay; raise to 1.5 if you still see hitches)\n"
+                  "interpDelay=1.0\n"
+                  "; menus: drop the game's 64 fps menu cap\n"
+                  "unlockMenus=1\n"
+                  "; menu frame limiter (-1 = same as targetFPS, 0 = off/vsync)\n"
+                  "menuTargetFPS=-1\n"
                   "logToFile=1\n"
                   "logEverySeconds=10\n", f);
             fclose(f);
@@ -178,6 +209,9 @@ static void LoadConfig() {
         else if (!_stricmp(key, "targetFPS"))         g_cfg.targetFPS = atoi(val);
         else if (!_stricmp(key, "maxStepDistance"))   g_cfg.maxStepDistance = (float)atof(val);
         else if (!_stricmp(key, "maxStepAngle"))      g_cfg.maxStepAngle = (float)atof(val);
+        else if (!_stricmp(key, "interpDelay"))       g_cfg.interpDelay = (float)atof(val);
+        else if (!_stricmp(key, "unlockMenus"))       g_cfg.unlockMenus = atoi(val);
+        else if (!_stricmp(key, "menuTargetFPS"))     g_cfg.menuTargetFPS = atoi(val);
         else if (!_stricmp(key, "logToFile"))         g_cfg.logToFile = atoi(val);
         else if (!_stricmp(key, "logEverySeconds"))   g_cfg.logEverySeconds = atoi(val);
     }
@@ -209,8 +243,9 @@ static void OpenLog() {
     snprintf(path, sizeof(path), "%sHSFrameFix.log", g_asiDir);
     g_log = fopen(path, "w");
     Logf("HSFrameFix v" HSFF_VERSION " | interpolate=%d copter=%d preciseTicks=%d targetFPS=%d "
-         "maxStepDistance=%.1f maxStepAngle=%.0f\n", g_cfg.interpolate, g_cfg.interpolateCopter,
-         g_cfg.preciseTicks, g_cfg.targetFPS, g_cfg.maxStepDistance, g_cfg.maxStepAngle);
+         "maxStepDistance=%.1f maxStepAngle=%.0f interpDelay=%.2f unlockMenus=%d menuTargetFPS=%d\n", g_cfg.interpolate,
+         g_cfg.interpolateCopter, g_cfg.preciseTicks, g_cfg.targetFPS, g_cfg.maxStepDistance,
+         g_cfg.maxStepAngle, g_cfg.interpDelay, g_cfg.unlockMenus, g_cfg.menuTargetFPS);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,45 +412,25 @@ static void InstallTickScheduler() {
 }
 
 // ---------------------------------------------------------------------------
-// 64 Hz tick timestamps (wrapper around the game's tick handler)
-// ---------------------------------------------------------------------------
-struct TickStamp { long c64; LONGLONG t; };
-static volatile LONG g_stampSeq = 0;
-static TickStamp g_stamp = { -1, 0 };
-static long g_lastC64Seen = -1;
-
-extern "C" void __cdecl OnTickHandled() {
-    long c = Rd<long>(hs::pCount64);
-    if (c == g_lastC64Seen) return;
-    g_lastC64Seen = c;
-    LONGLONG t = g_ticksActive ? g_lastGridTime.load() : Qpc();
-    InterlockedIncrement(&g_stampSeq);            // odd = writing
-    g_stamp.c64 = c; g_stamp.t = t;
-    InterlockedIncrement(&g_stampSeq);
-}
-static TickStamp ReadStamp() {
-    for (;;) {
-        LONG s1 = g_stampSeq; MemoryBarrier();
-        TickStamp v = g_stamp; MemoryBarrier();
-        if (!(s1 & 1) && s1 == g_stampSeq) return v;
-        YieldProcessor();
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Transform snapshots
 // ---------------------------------------------------------------------------
 struct Xform { float p[3]; float m[9]; };
 struct Entry { DWORD obj; int kind; Xform x; };    // kind: 0 car, 1 camera, 2 copter (pos only)
 static const int kMaxEntries = 128;
-struct Snapshot { int n = 0; long step = 0; DWORD activeCam[2] = {0, 0}; Entry e[kMaxEntries]; };
+struct Snapshot { int n = 0; long step = 0; DWORD activeCam[2] = {0, 0}; long lookMode[2] = {0, 0};
+                  Entry e[kMaxEntries]; };
 
-static Snapshot g_snap[2];       // [g_cur] latest, [g_cur^1] previous
-static int  g_cur = 0;
-static int  g_snapCount = 0;     // valid snapshots (0..2)
+static const int kRing = 4;
+static Snapshot g_ring[kRing];   // g_ring[g_head] = latest
+static int  g_head = 0;
+static int  g_ringN = 0;         // valid snapshots (0..kRing)
 static long g_lastStepIdx = 0;
-// step-index -> 64 Hz tick offset, minimum over a window (= on-time steps)
-static long g_offHist[64]; static int g_offPos = 0, g_offN = 0;
+// Smoothed sim clock: step index s is shown at time g_clockT0 + s * p64.
+// g_clockT0 follows the steps' arrival times with a slow average, so frame-to-
+// frame lateness (vsync, input batching) never moves the timeline by a whole step.
+static LONGLONG g_clockT0 = 0;
+static bool g_clockValid = false;
+static std::atomic<unsigned long> g_clockSnaps{0};
 
 static inline bool ReadXform(DWORD obj, int kind, Xform* x) {
     DWORD po = kind == 1 ? 0x14 : 0x08;
@@ -441,6 +456,7 @@ static DWORD EffectiveCam(int v) {
 static void Collect(Snapshot& s) {
     s.n = 0;
     s.activeCam[0] = EffectiveCam(0); s.activeCam[1] = EffectiveCam(1);
+    s.lookMode[0] = Rd<long>(hs::pLookMode); s.lookMode[1] = Rd<long>(hs::pLookMode + 4);
     long nc = Rd<long>(hs::pCarCount);
     if (nc < 0) nc = 0;
     if (nc > 16) nc = 16;
@@ -477,25 +493,34 @@ static void Collect(Snapshot& s) {
 
 static std::atomic<unsigned long> g_steps{0}, g_resets{0};
 
+static LONGLONG StepPeriodQpc() { return TickPeriodQpc() * 2; }   // 64 Hz
+
 extern "C" void __cdecl OnSimStep() {
+    LONGLONG now = Qpc();
     long idx = Rd<long>(hs::pSimStepIdx);           // index of the step that just ran
-    if (g_snapCount && idx == g_lastStepIdx) {       // replay fast-forward: 2 steps per index
-        Collect(g_snap[g_cur]);
+    if (g_ringN && idx == g_lastStepIdx) {           // replay fast-forward: 2 steps per index
+        Collect(g_ring[g_head]);
         g_steps++;
         return;
     }
-    if (g_snapCount && (idx < g_lastStepIdx || idx - g_lastStepIdx > 16)) {
-        g_snapCount = 0; g_offN = 0; g_resets++;     // restart / jump: no blending across it
+    if (g_ringN && (idx < g_lastStepIdx || idx - g_lastStepIdx > 16)) {
+        g_ringN = 0; g_clockValid = false; g_resets++;   // restart / jump: no blending across it
     }
     g_lastStepIdx = idx;
-    g_cur ^= 1;
-    Snapshot& s = g_snap[g_cur];
+    g_head = (g_head + 1) % kRing;
+    Snapshot& s = g_ring[g_head];
     Collect(s);
     s.step = idx;
-    if (g_snapCount < 2) g_snapCount++;
-    // offset between this step and the 64 Hz counter
-    long c = Rd<long>(hs::pCount64);
-    g_offHist[g_offPos] = c - idx; g_offPos = (g_offPos + 1) & 63; if (g_offN < 64) g_offN++;
+    if (g_ringN < kRing) g_ringN++;
+
+    LONGLONG p = StepPeriodQpc();
+    LONGLONG t0 = now - (LONGLONG)idx * p;           // arrival-based origin of this step
+    if (!g_clockValid) { g_clockT0 = t0; g_clockValid = true; }
+    else {
+        LONGLONG d = t0 - g_clockT0;
+        if (d > 4 * p || d < -4 * p) { g_clockT0 = t0; g_clockSnaps++; }   // lost sync: snap
+        else g_clockT0 += d / 32;                                         // slow follow
+    }
     g_steps++;
 }
 
@@ -566,47 +591,103 @@ static bool Blend(const Xform& a, const Xform& b, int kind, float t, Xform* out)
 // Render wrapper
 // ---------------------------------------------------------------------------
 static Snapshot g_saved;          // live values while an interpolated frame is drawn
+static const Entry* FindEntry(const Snapshot& s, DWORD obj, int kind) {
+    for (int j = 0; j < s.n; j++) if (s.e[j].obj == obj && s.e[j].kind == kind) return &s.e[j];
+    return nullptr;
+}
 static Xform    g_written[kMaxEntries];
 static bool     g_wrote[kMaxEntries];
 static bool g_applied = false;
 static HANDLE g_limTimer = nullptr;
 static LONGLONG g_limNext = 0;
-static std::atomic<unsigned long> g_renders{0}, g_extraRenders{0}, g_blended{0}, g_rejected{0};
+static std::atomic<unsigned long> g_renders{0}, g_extraRenders{0}, g_blended{0}, g_rejected{0}, g_cuts{0};
 static double g_alphaSum = 0; static unsigned long g_alphaN = 0, g_alphaClamped = 0;
 extern "C" { int g_extraEnabled = 0; DWORD g_fnSimStep = 0x51BBE0, g_fnRender = 0x5113E0,
-                                     g_fnTickHandler = 0x459E10; }
+                                     g_fnMenuIdle = 0x526460; }
 
-static void Limiter() {
-    if (g_cfg.targetFPS <= 0) return;
-    LONGLONG period = g_qpf.QuadPart / g_cfg.targetFPS, now = Qpc();
-    if (g_limNext && now < g_limNext) { WaitUntilOn(g_limTimer, g_limNext); now = Qpc(); }
-    if (!g_limNext || now - g_limNext > period) g_limNext = now + period; else g_limNext += period;
+// Frames reach the screen on the display's schedule, not when the CPU happens
+// to start them, so the time used for blending follows a smoothed frame clock.
+static LONGLONG g_ftLast = 0, g_ftInterval = 0;
+static LONGLONG FrameTime() {
+    LONGLONG now = Qpc();
+    if (!g_ftLast) { g_ftLast = now; return now; }
+    LONGLONG d = now - g_ftLast;
+    if (!g_ftInterval) g_ftInterval = d;
+    LONGLONG pred = g_ftLast + g_ftInterval;
+    LONGLONG err = now - pred;
+    LONGLONG ft;
+    if (g_ftInterval > 0 && err < g_ftInterval / 2 && err > -g_ftInterval / 2) {
+        ft = pred + err / 8;                                  // on schedule: follow gently
+        g_ftInterval += (d - g_ftInterval) / 16;
+    } else {
+        ft = now;                                             // hitch / rate change: resync
+        if (d > 0 && d < g_qpf.QuadPart / 10) g_ftInterval = d;
+    }
+    g_ftLast = ft;
+    return ft;
+}
+
+static void LimitTo(int fps, LONGLONG& next) {
+    if (fps <= 0) return;
+    LONGLONG period = g_qpf.QuadPart / fps, now = Qpc();
+    if (next && now < next) { WaitUntilOn(g_limTimer, next); now = Qpc(); }
+    if (!next || now - next > period) next = now + period; else next += period;
+}
+static void Limiter() { LimitTo(g_cfg.targetFPS, g_limNext); }
+
+static LONGLONG g_menuNext = 0;
+static std::atomic<unsigned long> g_menuFrames{0};
+extern "C" void __cdecl MenuFrame() {
+    int fps = g_cfg.menuTargetFPS < 0 ? g_cfg.targetFPS : g_cfg.menuTargetFPS;
+    LimitTo(fps, g_menuNext);
+    g_menuFrames++;
 }
 
 extern "C" void __cdecl PreRender() {
     Limiter();
     g_renders++;
     g_applied = false;
-    if (!g_cfg.interpolate || g_snapCount < 2) return;
-    const Snapshot& A = g_snap[g_cur ^ 1];
-    const Snapshot& B = g_snap[g_cur];
-    long span = B.step - A.step;
-    if (span <= 0 || span > 8) return;
+    if (!g_cfg.interpolate || g_ringN < 2 || !g_clockValid) return;
 
-    // When was step B due? stepIdx + min(offset) = its 64 Hz tick.
-    long offMin = 0x7fffffff;
-    for (int i = 0; i < g_offN; i++) if (g_offHist[i] < offMin) offMin = g_offHist[i];
-    TickStamp ts = ReadStamp();
-    if (ts.c64 < 0 || offMin == 0x7fffffff) return;
-    LONGLONG p64 = TickPeriodQpc() * 2;
-    LONGLONG dueB = ts.t - (LONGLONG)(ts.c64 - (B.step + offMin)) * p64;
-    LONGLONG dueA = dueB - (LONGLONG)span * p64;
-    LONGLONG renderT = Qpc() - p64;                  // show the world one step behind
-    float t = (float)((double)(renderT - dueA) / (double)(dueB - dueA));
-    if (t < 0.0f) { t = 0.0f; g_alphaClamped++; }
-    if (t >= 1.0f) { t = 1.0f; g_alphaClamped++; }
+    // Position on the smoothed sim timeline, one step (interpDelay) behind.
+    LONGLONG p = StepPeriodQpc();
+    double r = (double)(FrameTime() - g_clockT0) / (double)p - g_cfg.interpDelay;
+    // Find consecutive snapshots A.step <= r < B.step (newest first).
+    const Snapshot* A = nullptr; const Snapshot* B = nullptr;
+    for (int k = 0; k + 1 < g_ringN; k++) {
+        const Snapshot& nb = g_ring[(g_head - k + kRing) % kRing];
+        const Snapshot& na = g_ring[(g_head - k - 1 + kRing) % kRing];
+        if (k == 0 && r >= (double)nb.step) { g_alphaClamped++; g_alphaSum += 1; g_alphaN++; return; }
+        if (r >= (double)na.step) { A = &na; B = &nb; break; }
+    }
+    if (!A) {                                        // older than the history: oldest pair
+        int k = g_ringN - 2;
+        B = &g_ring[(g_head - k + kRing) % kRing];
+        A = &g_ring[(g_head - k - 1 + kRing) % kRing];
+        g_alphaClamped++;
+        r = (double)A->step;
+    }
+    long span = B->step - A->step;
+    if (span <= 0 || span > 8) return;
+    float t = (float)((r - (double)A->step) / (double)span);
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
     g_alphaSum += t; g_alphaN++;
-    if (t >= 1.0f) return;                           // already at the latest state
+
+    // Camera cut inside this pair (other camera, look back/left/right toggled,
+    // or a jump too big to blend): draw the whole frame at the newest step so
+    // the camera and the cars stay consistent.
+    for (int v = 0; v < 2; v++) {
+        if (A->activeCam[v] != B->activeCam[v] || A->lookMode[v] != B->lookMode[v]) { g_cuts++; return; }
+        DWORD cam = B->activeCam[v];
+        if (!cam) continue;
+        const Entry* ca = FindEntry(*A, cam, 1);
+        const Entry* cb = FindEntry(*B, cam, 1);
+        Xform tmp;
+        if (ca && cb && !Blend(ca->x, cb->x, 1, 0.5f, &tmp)) { g_cuts++; return; }
+    }
+    if (Rd<long>(hs::pLookMode) != B->lookMode[0] || Rd<long>(hs::pLookMode + 4) != B->lookMode[1] ||
+        EffectiveCam(0) != B->activeCam[0] || EffectiveCam(1) != B->activeCam[1]) { g_cuts++; return; }
 
     // Current live values (normally == B) are saved and restored after drawing.
     Collect(g_saved);
@@ -616,15 +697,15 @@ extern "C" void __cdecl PreRender() {
         if (cur.kind == 1) {                           // camera cut: don't blend into it
             bool cut = false;
             for (int v = 0; v < 2; v++)
-                if (cur.obj == g_saved.activeCam[v] && A.activeCam[v] != cur.obj) cut = true;
+                if (cur.obj == g_saved.activeCam[v] &&
+                    (A->activeCam[v] != cur.obj || B->activeCam[v] != cur.obj)) cut = true;
             if (cut) { g_rejected++; continue; }
         }
-        const Entry* pa = nullptr;
-        for (int j = 0; j < A.n; j++)
-            if (A.e[j].obj == cur.obj && A.e[j].kind == cur.kind) { pa = &A.e[j]; break; }
-        if (!pa) continue;
+        const Entry* pa = FindEntry(*A, cur.obj, cur.kind);
+        const Entry* pb = FindEntry(*B, cur.obj, cur.kind);
+        if (!pa || !pb) continue;
         Xform x;
-        if (Blend(pa->x, cur.x, cur.kind, t, &x)) {
+        if (Blend(pa->x, pb->x, cur.kind, t, &x)) {
             WriteXform(cur.obj, cur.kind, x);
             g_written[i] = x; g_wrote[i] = true; g_blended++;
         }
@@ -657,7 +738,7 @@ extern "C" void __cdecl NoteExtraRender() { g_extraRenders++; }
 extern "C" void StepStub();
 extern "C" void RenderStub();
 extern "C" void ExtraRenderStub();
-extern "C" void TickHandlerStub();
+extern "C" void MenuWaitStub();
 asm(".text\n"
     // call site of the sim step: run it, then snapshot
     ".globl _StepStub\n"
@@ -706,25 +787,32 @@ asm(".text\n"
     "    movl 0x853B7C, %edi\n"
     "2:  pushl $0x51CB88\n"
     "    ret\n"
-    // registered in place of the game's 128 Hz tick handler
-    ".globl _TickHandlerStub\n"
-    "_TickHandlerStub:\n"
+    // replaces the menu's "wait for 2 ticks" loop (jumped to, inside 0x538170)
+    ".globl _MenuWaitStub\n"
+    "_MenuWaitStub:\n"
     "    pushfl\n"
     "    pushal\n"
-    "    call *_g_fnTickHandler\n"
-    "    call _OnTickHandled\n"
+    "    call *_g_fnMenuIdle\n"      // the work the wait loop used to do
+    "    call _MenuFrame\n"           // optional limiter
     "    popal\n"
     "    popfl\n"
+    "    movl 0x9E6D54, %eax\n"
+    "    movl %eax, -8(%ebp)\n"
+    "    pushl $0x5381A9\n"
     "    ret\n");
+
+static void InstallMenuUnlock() {
+    if (!g_knownExe || !g_cfg.unlockMenus) { Logf("menus: original 64 fps cap\n"); return; }
+    if (!g_limTimer) g_limTimer = CreateHiResTimer();
+    bool ok = PatchRel32(hs::menuWaitAt, 0xE9, (void*)&MenuWaitStub);
+    Logf("menus: %s\n", ok ? "unlocked" : "patch FAILED");
+}
 
 static void InstallInterpolation() {
     if (!g_knownExe || !g_cfg.interpolate) { Logf("interpolation: off\n"); return; }
     bool ok = true;
     for (DWORD at : hs::callSimStep) ok &= PatchRel32(at, 0xE8, (void*)&StepStub);
     ok &= PatchRel32(hs::callRender, 0xE8, (void*)&RenderStub);
-    DWORD stub = (DWORD)&TickHandlerStub;
-    ok &= PatchBytes(hs::immRegHandler, &stub, 4);
-    ok &= PatchBytes(hs::immUnregHandler, &stub, 4);
     BYTE j[6] = { 0xE9, 0, 0, 0, 0, 0x90 };
     DWORD rel = (DWORD)&ExtraRenderStub - (hs::skipRenderAt + 5);
     memcpy(j + 1, &rel, 4);
@@ -738,20 +826,24 @@ static void InstallInterpolation() {
 // Stats thread
 // ---------------------------------------------------------------------------
 static DWORD WINAPI StatsThread(LPVOID) {
-    unsigned long ls = 0, lr = 0, le = 0, lf = 0, lb = 0, lrej = 0;
+    unsigned long ls = 0, lr = 0, le = 0, lf = 0, lb = 0, lrej = 0, lcut = 0, lmf = 0;
     for (;;) {
         int sec = g_cfg.logEverySeconds > 0 ? g_cfg.logEverySeconds : 10;
         Sleep(sec * 1000);
+        unsigned long mf = g_menuFrames;
+        if (mf != lmf) Logf("last %ds: menu frames %.1f/s\n", sec, (mf - lmf) / (double)sec);
+        lmf = mf;
         unsigned long s = g_steps, r = g_renders, e = g_extraRenders, f = g_tickFires,
                       b = g_blended, rj = g_rejected;
         if (s != ls || r != lr)
             Logf("last %ds: sim %.1f/s, frames %.1f/s (%.1f/s between steps), ticks %.1f/s, "
-                 "blended %lu, not blended %lu, avg blend %.2f, clamped %lu, resets %lu\n",
+                 "blended %lu, not blended %lu, camera-cut frames %lu, avg blend %.2f, clamped %lu, resets %lu, clock resyncs %lu\n",
                  sec, (s - ls) / (double)sec, (r - lr) / (double)sec, (e - le) / (double)sec,
-                 (f - lf) / (double)sec, b - lb, rj - lrej,
-                 g_alphaN ? g_alphaSum / g_alphaN : 0.0, g_alphaClamped, (unsigned long)g_resets);
+                 (f - lf) / (double)sec, b - lb, rj - lrej, (unsigned long)g_cuts - lcut,
+                 g_alphaN ? g_alphaSum / g_alphaN : 0.0, g_alphaClamped, (unsigned long)g_resets,
+                 (unsigned long)g_clockSnaps);
         g_alphaSum = 0; g_alphaN = 0; g_alphaClamped = 0;
-        ls = s; lr = r; le = e; lf = f; lb = b; lrej = rj;
+        ls = s; lr = r; le = e; lf = f; lb = b; lrej = rj; lcut = g_cuts;
     }
 }
 
@@ -767,6 +859,7 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
         timeBeginPeriod(1);
         InstallTickScheduler();
         InstallInterpolation();
+        InstallMenuUnlock();
         if (g_log) CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
         if (reserved) g_logLockInit = false;
