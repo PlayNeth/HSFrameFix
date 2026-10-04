@@ -33,6 +33,8 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.6.5: exeCheck=0 patches a modified nfs4.exe anyway; every differing byte
+//    range is logged (expected vs found) either way.
 //  - v0.6.4: menuMaxFPS - menus never run above 128 fps (auto: a divisor of the
 //    refresh rate), since several menu animations speed up past the 128 Hz tick.
 //  - v0.6.3: only the menu item reveal timing is changed; the list-slide and FeFx
@@ -84,7 +86,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.6.4"
+#define HSFF_VERSION "0.6.5"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -208,6 +210,7 @@ struct Config {
     int   fovKeyReset      = 0x75;  // F6
     int   fovStep          = 1;
     int   glideMenuEffects = 1;
+    int   exeCheck         = 1;     // 1 = turn the mod off if nfs4.exe differs, 0 = patch anyway
     int   menuMaxFPS       = -1;    // -1 = auto (<= 128, divides the refresh rate), 0 = none
     int   logToFile        = 1;
     int   logEverySeconds  = 10;
@@ -255,6 +258,12 @@ static const char kMenuMaxBlock[] =
     ";     -1 = auto: the highest rate <= 128 that divides your refresh rate (120 Hz -> 120,\n"
     ";     144 Hz -> 72, 240 Hz -> 120); 0 = no ceiling; N = at most N fps ---\n"
     "menuMaxFPS=-1\n";
+static const char kExeCheckBlock[] =
+    "; --- exe check: the mod compares the bytes it patches with the nfs4.exe it was made\n"
+    ";     for. 1 = if anything differs, turn the mod off; 0 = patch anyway (every\n"
+    ";     difference is still written to the log). Only use 0 with a modified exe you\n"
+    ";     know is the same version - patching the wrong code can crash the game ---\n"
+    "exeCheck=1\n";
 static char g_iniPath[MAX_PATH] = {};
 
 static void LoadConfig() {
@@ -291,12 +300,13 @@ static void LoadConfig() {
             fputs(kNewKeysBlock, f);
             fputs(kGlideBlock, f);
             fputs(kMenuMaxBlock, f);
+            fputs(kExeCheckBlock, f);
             fclose(f);
         }
         return;
     }
     char line[256];
-    bool sawNew = false, sawGlide = false, sawMenuMax = false;
+    bool sawNew = false, sawGlide = false, sawMenuMax = false, sawExeCheck = false;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
         char key[64] = {}, val[64] = {};
@@ -324,6 +334,7 @@ static void LoadConfig() {
         else if (!_stricmp(key, "fovStep"))           g_cfg.fovStep = atoi(val);
         else if (!_stricmp(key, "glideMenuEffects"))  { g_cfg.glideMenuEffects = atoi(val); sawGlide = true; }
         else if (!_stricmp(key, "menuMaxFPS"))        { g_cfg.menuMaxFPS = atoi(val); sawMenuMax = true; }
+        else if (!_stricmp(key, "exeCheck"))          { g_cfg.exeCheck = atoi(val); sawExeCheck = true; }
         else if (!_stricmp(key, "logToFile"))         g_cfg.logToFile = atoi(val);
         else if (!_stricmp(key, "logEverySeconds"))   g_cfg.logEverySeconds = atoi(val);
     }
@@ -339,6 +350,10 @@ static void LoadConfig() {
     if (!sawMenuMax) {
         FILE* a = fopen(path, "a");
         if (a) { fputs("\n", a); fputs(kMenuMaxBlock, a); fclose(a); }
+    }
+    if (!sawExeCheck) {
+        FILE* a = fopen(path, "a");
+        if (a) { fputs("\n", a); fputs(kExeCheckBlock, a); fclose(a); }
     }
 }
 
@@ -459,14 +474,32 @@ static bool CheckExe() {
     if (GetModuleHandleA(nullptr) != (HMODULE)0x400000) {
         Logf("exe check: unexpected image base - disabled\n"); return false;
     }
+    int bad = 0, total = 0;
     for (const auto& s : hs::kSigs) {
-        if (IsBadReadPtr((void*)s.addr, s.len) || memcmp((void*)s.addr, s.bytes, s.len)) {
-            Logf("exe check: bytes at 0x%06lX differ - not the analysed nfs4.exe, disabled\n",
-                 (unsigned long)s.addr);
-            return false;
+        total++;
+        if (IsBadReadPtr((void*)s.addr, s.len)) {
+            Logf("exe check: 0x%06lX unreadable\n", (unsigned long)s.addr); bad++; continue;
         }
+        if (!memcmp((void*)s.addr, s.bytes, s.len)) continue;
+        bad++;
+        char exp[3 * 24 + 1] = {}, got[3 * 24 + 1] = {};
+        const BYTE* g = (const BYTE*)s.addr;
+        size_t n = s.len < 24 ? s.len : 24;
+        for (size_t i = 0; i < n; i++) {
+            bool d = g[i] != (BYTE)s.bytes[i];
+            snprintf(exp + i * 3, 4, "%02X%c", (BYTE)s.bytes[i], d ? '*' : ' ');
+            snprintf(got + i * 3, 4, "%02X%c", g[i], d ? '*' : ' ');
+        }
+        Logf("exe check: 0x%06lX differs (* = changed byte)\n    expected %s\n    found    %s\n",
+             (unsigned long)s.addr, exp, got);
     }
-    Logf("exe check: nfs4.exe matches\n");
+    if (!bad) { Logf("exe check: nfs4.exe matches (%d checks)\n", total); return true; }
+    if (g_cfg.exeCheck) {
+        Logf("exe check: %d of %d checks differ - not the analysed nfs4.exe, mod disabled "
+             "(exeCheck=0 in the ini patches anyway)\n", bad, total);
+        return false;
+    }
+    Logf("exe check: %d of %d checks differ - exeCheck=0, patching anyway\n", bad, total);
     return true;
 }
 
