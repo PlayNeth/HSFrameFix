@@ -33,6 +33,9 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.5.2: FOV hotkeys no longer write the ini / log on the game thread (a
+//    background thread saves them), so a burst of key presses can't stall a frame.
+//    The log now says when clamped frames happened.
 //  - v0.5.1: the cockpit model (0x4D1C80) uses its own fixed 80 degree FOV; it now
 //    scales with the in-car FOV offset so the dashboard widens with the world.
 //  - v0.5: loading. The loading bar (0x4E7B80, ~48 calls per race load) does a
@@ -69,7 +72,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.5.1"
+#define HSFF_VERSION "0.5.2"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -313,6 +316,42 @@ static void Logf(const char* fmt, ...) {
     va_end(ap);
     fflush(g_log);
     if (g_logLockInit) LeaveCriticalSection(&g_logLock);
+}
+
+// Log lines from the game thread go through a queue and are written by a
+// background thread, so the game thread never waits on the disk.
+static CRITICAL_SECTION g_qLock;
+static HANDLE g_qEvent = nullptr;
+static char g_q[64][192];
+static int g_qHead = 0, g_qTail = 0;
+static void LogfAsync(const char* fmt, ...) {
+    if (!g_log || !g_qEvent) return;
+    char buf[192];
+    SYSTEMTIME st; GetLocalTime(&st);
+    int n = snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond,
+                     st.wMilliseconds);
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+    va_end(ap);
+    EnterCriticalSection(&g_qLock);
+    int next = (g_qHead + 1) % 64;
+    if (next != g_qTail) { memcpy(g_q[g_qHead], buf, sizeof(buf)); g_qHead = next; }
+    LeaveCriticalSection(&g_qLock);
+    SetEvent(g_qEvent);
+}
+static void DrainLogQueue() {
+    for (;;) {
+        char line[192];
+        EnterCriticalSection(&g_qLock);
+        bool any = g_qTail != g_qHead;
+        if (any) { memcpy(line, g_q[g_qTail], sizeof(line)); g_qTail = (g_qTail + 1) % 64; }
+        LeaveCriticalSection(&g_qLock);
+        if (!any) break;
+        if (!g_log) continue;
+        if (g_logLockInit) EnterCriticalSection(&g_logLock);
+        fputs(line, g_log); fflush(g_log);
+        if (g_logLockInit) LeaveCriticalSection(&g_logLock);
+    }
 }
 
 static void OpenLog() {
@@ -680,6 +719,15 @@ static HANDLE g_limTimer = nullptr;
 static LONGLONG g_limNext = 0;
 static std::atomic<unsigned long> g_renders{0}, g_extraRenders{0}, g_blended{0}, g_rejected{0}, g_cuts{0};
 static double g_alphaSum = 0; static unsigned long g_alphaN = 0, g_alphaClamped = 0;
+// clamp details for the log: when the first one in the window happened and how far off it was
+static volatile bool g_clampHave = false; static SYSTEMTIME g_clampFirst;
+static double g_clampAheadMs = 0, g_clampBehindMs = 0;
+static void NoteClamp(double steps) {             // >0: frame ahead of newest step, <0: behind history
+    double ms = steps * 1000.0 / 64.0;
+    if (!g_clampHave) { GetLocalTime(&g_clampFirst); g_clampHave = true; }
+    if (ms > g_clampAheadMs) g_clampAheadMs = ms;
+    if (-ms > g_clampBehindMs) g_clampBehindMs = -ms;
+}
 extern "C" { int g_extraEnabled = 0; DWORD g_fnSimStep = 0x51BBE0, g_fnRender = 0x5113E0,
                                      g_fnMenuIdle = 0x526460; }
 
@@ -737,7 +785,9 @@ extern "C" void __cdecl PreRender() {
     for (int k = 0; k + 1 < g_ringN; k++) {
         const Snapshot& nb = g_ring[(g_head - k + kRing) % kRing];
         const Snapshot& na = g_ring[(g_head - k - 1 + kRing) % kRing];
-        if (k == 0 && r >= (double)nb.step) { g_alphaClamped++; g_alphaSum += 1; g_alphaN++; return; }
+        if (k == 0 && r >= (double)nb.step) {
+            g_alphaClamped++; g_alphaSum += 1; g_alphaN++; NoteClamp(r - (double)nb.step); return;
+        }
         if (r >= (double)na.step) { A = &na; B = &nb; break; }
     }
     if (!A) {                                        // older than the history: oldest pair
@@ -745,6 +795,7 @@ extern "C" void __cdecl PreRender() {
         B = &g_ring[(g_head - k + kRing) % kRing];
         A = &g_ring[(g_head - k - 1 + kRing) % kRing];
         g_alphaClamped++;
+        NoteClamp(r - (double)A->step);
         r = (double)A->step;
     }
     long span = B->step - A->step;
@@ -1000,6 +1051,7 @@ static const char* FovName(int type) {
 }
 static std::atomic<int> g_fovLastType{-1};
 static unsigned g_fovSeen = 0;
+static volatile LONG g_iniDirty = 0;
 static volatile int g_fovGame = 90, g_fovAdj = 90;   // last non-mirror view: game FOV, our FOV
 
 static int CameraTypeForView(DWORD view) {
@@ -1018,7 +1070,7 @@ extern "C" int __cdecl FovAdjust(int fov, DWORD view) {
     if (int* p = FovSlot(type)) add += *p;
     if (type >= 0 && type < 32 && !(g_fovSeen & (1u << type))) {
         g_fovSeen |= 1u << type;
-        Logf("camera type %d (%s): game FOV %d, offset %+d\n", type, FovName(type), fov, add);
+        LogfAsync("camera type %d (%s): game FOV %d, offset %+d\n", type, FovName(type), fov, add);
     }
     g_fovLastType = type;
     int f = fov + add;
@@ -1040,7 +1092,7 @@ extern "C" int __cdecl DashFov() {
     if (f < 20) f = 20;
     if (f > 170) f = 170;
     static int logged = -1;
-    if (f != logged) { logged = f; Logf("cockpit FOV %d (world %d -> %d)\n", f, g, a); }
+    if (f != logged) { logged = f; LogfAsync("cockpit FOV %d (world %d -> %d)\n", f, g, a); }
     return f;
 }
 
@@ -1085,10 +1137,29 @@ static void FovHotkeys() {
             if (k == 0) *slot += g_cfg.fovStep; else if (k == 1) *slot -= g_cfg.fovStep; else *slot = 0;
             if (*slot > 60) *slot = 60;
             if (*slot < -50) *slot = -50;
-            ReplaceIniLine(FovSlot(type) ? FovKey(type) : "fovOffset", *slot);
-            Logf("FOV hotkey: %s offset now %+d\n", FovSlot(type) ? FovName(type) : "global", *slot);
+            g_iniDirty = 1;                       // saved by the writer thread
+            if (g_qEvent) SetEvent(g_qEvent);
+            LogfAsync("FOV hotkey: %s offset now %+d\n", FovSlot(type) ? FovName(type) : "global", *slot);
         }
         prev[k] = down;
+    }
+}
+
+// Saves FOV changes to the ini and writes queued log lines, off the game thread.
+static DWORD WINAPI WriterThread(LPVOID) {
+    for (;;) {
+        WaitForSingleObject(g_qEvent, 1000);
+        DrainLogQueue();
+        if (g_iniDirty) {
+            Sleep(500);                          // let a burst of key presses settle
+            g_iniDirty = 0;
+            ReplaceIniLine("fovOffset", g_cfg.fovOffset);
+            ReplaceIniLine("fovOffsetInCar", g_cfg.fovOffsetInCar);
+            ReplaceIniLine("fovOffsetBumper", g_cfg.fovOffsetBumper);
+            ReplaceIniLine("fovOffsetHeli", g_cfg.fovOffsetHeli);
+            ReplaceIniLine("fovOffsetRoof", g_cfg.fovOffsetRoof);
+            DrainLogQueue();
+        }
     }
 }
 
@@ -1150,6 +1221,11 @@ static DWORD WINAPI StatsThread(LPVOID) {
                  (f - lf) / (double)sec, b - lb, rj - lrej, (unsigned long)g_cuts - lcut,
                  g_alphaN ? g_alphaSum / g_alphaN : 0.0, g_alphaClamped, (unsigned long)g_resets,
                  (unsigned long)g_clockSnaps);
+        if (g_clampHave && s != ls)
+            Logf("  clamps: first at %02d:%02d:%02d.%03d, frame up to %.1f ms past the newest step, %.1f ms before the oldest\n",
+                 g_clampFirst.wHour, g_clampFirst.wMinute, g_clampFirst.wSecond, g_clampFirst.wMilliseconds,
+                 g_clampAheadMs, g_clampBehindMs);
+        g_clampHave = false; g_clampAheadMs = 0; g_clampBehindMs = 0;
         g_alphaSum = 0; g_alphaN = 0; g_alphaClamped = 0;
         ls = s; lr = r; le = e; lf = f; lb = b; lrej = rj; lcut = g_cuts;
     }
@@ -1168,7 +1244,10 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
         InstallTickScheduler();
         InstallInterpolation();
         InstallMenuUnlock();
+        InitializeCriticalSection(&g_qLock);
+        g_qEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
         InstallLoadingAndFov();
+        if (g_qEvent) CreateThread(nullptr, 0, WriterThread, nullptr, 0, nullptr);
         if (g_log) CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
         if (reserved) g_logLockInit = false;
