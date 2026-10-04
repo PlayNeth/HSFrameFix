@@ -33,6 +33,8 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.6.1: menu item reveal / glow and two other menu animations no longer run
+//    faster above 64 fps (they counted at least 2 ticks per frame).
 //  - v0.6: glideMenuEffects - the front end's Glide-only effects (menu glow, full
 //    brightness highlight colours, widget timing, a transition render state) on Direct3D.
 //  - v0.5.3: crash / recovery cameras keep the FOV offset of the camera the player
@@ -76,7 +78,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.6"
+#define HSFF_VERSION "0.6.1"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -165,6 +167,9 @@ namespace hs {
         { 0x5361CD, "\xF6\x05\xC0\x87\x82\x00\x08\x0F\x84\xA1\x00\x00\x00", 13 },
         { 0x49E40E, "\x8A\x1D\xC0\x87\x82\x00\xF6\xC3\x08\x0F\x85\x59\x02\x00\x00", 15 }, // menu glow
         { 0x4AAF39, "\x8A\x0D\xC0\x87\x82\x00\xF6\xC1\x08\x75\x05", 11 },
+        { 0x4AAF9B, "\x83\xFE\x02\x7D\x07\xC7\x45\xEC\x02\x00\x00\x00", 12 },   // menu item reveal: min 2 ticks
+        { 0x4871CF, "\x83\x7D\xF8\x02\x7D\x07\xC7\x45\xF8\x02\x00\x00\x00", 13 },
+        { 0x4AA18B, "\x83\x7D\xF4\x02\x7D\x07\xC7\x45\xF4\x02\x00\x00\x00", 13 },
         { 0x539F8A, "\x89\x45\xFC", 3 },                                      // view -> [ebp-4]
         { 0x539FA6, "\xE8\x65\xFE\xFF\xFF", 5 },
         { 0x539FCB, "\xE8\x40\xFE\xFF\xFF", 5 },
@@ -1201,7 +1206,16 @@ static void InstallMenuUnlock() {
     if (!g_knownExe || !g_cfg.unlockMenus) { Logf("menus: original 64 fps cap\n"); return; }
     if (!g_limTimer) g_limTimer = CreateHiResTimer();
     bool ok = PatchRel32(hs::menuWaitAt, 0xE9, (void*)&MenuWaitStub);
-    Logf("menus: %s\n", ok ? "unlocked" : "patch FAILED");
+    // Three menu animations advance by the 128 Hz ticks since the last frame but
+    // count at least 2 (or treat 0 as 2): fine at 64 fps, too fast above it. When
+    // less time has passed, skip the update and let the ticks add up instead.
+    static const BYTE skip1[] = { 0xEB, 0x44, 0x90, 0x90, 0x90, 0x90, 0x90 };  // 0x4AAFA0 -> 0x4AAFE6
+    static const BYTE skip2[] = { 0xEB, 0x3D, 0x90, 0x90, 0x90, 0x90, 0x90 };  // 0x4871D5 -> 0x487214
+    static const BYTE skip3[] = { 0xEB, 0x1A, 0x90, 0x90, 0x90, 0x90, 0x90 };  // 0x4AA191 -> 0x4AA1AD
+    bool ok2 = PatchBytes(0x4AAFA0, skip1, 7) && PatchBytes(0x4871D5, skip2, 7) &&
+               PatchBytes(0x4AA191, skip3, 7);
+    Logf("menus: %s, menu animation timing %s\n", ok ? "unlocked" : "patch FAILED",
+         ok2 ? "fixed" : "patch FAILED");
 }
 
 // The front end checks the renderer class ([0x8287C0], from the driver's thrash.ini
