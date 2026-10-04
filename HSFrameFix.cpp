@@ -33,6 +33,8 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.6: glideMenuEffects - the front end's Glide-only effects (menu glow, full
+//    brightness highlight colours, widget timing, a transition render state) on Direct3D.
 //  - v0.5.3: crash / recovery cameras keep the FOV offset of the camera the player
 //    picked ([0x7C3CA8+view*4]) instead of falling back to the global offset only.
 //  - v0.5.2: FOV hotkeys no longer write the ini / log on the game thread (a
@@ -74,7 +76,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.5.3"
+#define HSFF_VERSION "0.6"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -159,6 +161,10 @@ namespace hs {
         { 0x539E10, "\x52\x55\x89\xE5\x83\xEC\x04\xBA\x5A\x00\x00\x00", 12 },       // GetViewFov (90)
         { 0x4D1DA8, "\xBA\x50\x00\x00\x00\xB8\x10\x3A\x85\x00", 10 },          // cockpit FOV 80
         { 0x43DEBE, "\x89\x04\x95\xA8\x3C\x7C\x00", 7 },                       // selected camera slot
+        { 0x528C43, "\xF6\x05\xC0\x87\x82\x00\x08\x74\x35", 9 },                // menu colours: D3D halves them
+        { 0x5361CD, "\xF6\x05\xC0\x87\x82\x00\x08\x0F\x84\xA1\x00\x00\x00", 13 },
+        { 0x49E40E, "\x8A\x1D\xC0\x87\x82\x00\xF6\xC3\x08\x0F\x85\x59\x02\x00\x00", 15 }, // menu glow
+        { 0x4AAF39, "\x8A\x0D\xC0\x87\x82\x00\xF6\xC1\x08\x75\x05", 11 },
         { 0x539F8A, "\x89\x45\xFC", 3 },                                      // view -> [ebp-4]
         { 0x539FA6, "\xE8\x65\xFE\xFF\xFF", 5 },
         { 0x539FCB, "\xE8\x40\xFE\xFF\xFF", 5 },
@@ -192,6 +198,7 @@ struct Config {
     int   fovKeyDown       = 0x76;  // F7
     int   fovKeyReset      = 0x75;  // F6
     int   fovStep          = 1;
+    int   glideMenuEffects = 1;
     int   logToFile        = 1;
     int   logEverySeconds  = 10;
 };
@@ -228,6 +235,10 @@ static const char kNewKeysBlock[] =
     "fovKeyDown=0x76\n"
     "fovKeyReset=0x75\n"
     "fovStep=1\n";
+static const char kGlideBlock[] =
+    "; --- menus: the extra effects the game only draws on its Glide renderer (glow on\n"
+    ";     menu items, full-brightness highlights, ...), also on Direct3D drivers ---\n"
+    "glideMenuEffects=1\n";
 static char g_iniPath[MAX_PATH] = {};
 
 static void LoadConfig() {
@@ -262,12 +273,13 @@ static void LoadConfig() {
                   "logToFile=1\n"
                   "logEverySeconds=10\n", f);
             fputs(kNewKeysBlock, f);
+            fputs(kGlideBlock, f);
             fclose(f);
         }
         return;
     }
     char line[256];
-    bool sawNew = false;
+    bool sawNew = false, sawGlide = false;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
         char key[64] = {}, val[64] = {};
@@ -293,6 +305,7 @@ static void LoadConfig() {
         else if (!_stricmp(key, "fovKeyDown"))        g_cfg.fovKeyDown = (int)strtol(val, nullptr, 0);
         else if (!_stricmp(key, "fovKeyReset"))       g_cfg.fovKeyReset = (int)strtol(val, nullptr, 0);
         else if (!_stricmp(key, "fovStep"))           g_cfg.fovStep = atoi(val);
+        else if (!_stricmp(key, "glideMenuEffects"))  { g_cfg.glideMenuEffects = atoi(val); sawGlide = true; }
         else if (!_stricmp(key, "logToFile"))         g_cfg.logToFile = atoi(val);
         else if (!_stricmp(key, "logEverySeconds"))   g_cfg.logEverySeconds = atoi(val);
     }
@@ -300,6 +313,10 @@ static void LoadConfig() {
     if (!sawNew) {                        // ini from an older version: add the new keys
         FILE* a = fopen(path, "a");
         if (a) { fputs("\n", a); fputs(kNewKeysBlock, a); fclose(a); }
+    }
+    if (!sawGlide) {
+        FILE* a = fopen(path, "a");
+        if (a) { fputs("\n", a); fputs(kGlideBlock, a); fclose(a); }
     }
 }
 
@@ -1187,6 +1204,21 @@ static void InstallMenuUnlock() {
     Logf("menus: %s\n", ok ? "unlocked" : "patch FAILED");
 }
 
+// The front end checks the renderer class ([0x8287C0], from the driver's thrash.ini
+// Type=: d=8 Direct3D, v=4 Glide, s=1 software) in four places and drops effects on
+// Direct3D. Make those four behave as on Glide; software keeps its own checks.
+static void InstallGlideMenuEffects() {
+    if (!g_knownExe || !g_cfg.glideMenuEffects) { Logf("menu effects: original\n"); return; }
+    static const BYTE jmp8[]   = { 0xEB };                               // 0x528C4A: je -> jmp
+    static const BYTE jmp32[]  = { 0xE9, 0xA2, 0x00, 0x00, 0x00, 0x90 }; // 0x5361D4: je -> jmp 0x53627B
+    static const BYTE nop6[]   = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 }; // 0x49E417: drop "jne if D3D"
+    static const BYTE nop2[]   = { 0x90, 0x90 };                         // 0x4AAF42: drop "jne if D3D"
+    bool ok = PatchBytes(0x528C4A, jmp8, 1) && PatchBytes(0x5361D4, jmp32, 6) &&
+              PatchBytes(0x49E417, nop6, 6) && PatchBytes(0x4AAF42, nop2, 2);
+    Logf("menu effects: %s (Glide-style menu glow and colours on any renderer)\n",
+         ok ? "on" : "patch FAILED");
+}
+
 static void InstallLoadingAndFov() {
     InitializeCriticalSection(&g_loadLock);
     if (!g_knownExe) return;
@@ -1264,6 +1296,7 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
         InitializeCriticalSection(&g_qLock);
         g_qEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
         InstallLoadingAndFov();
+        InstallGlideMenuEffects();
         if (g_qEvent) CreateThread(nullptr, 0, WriterThread, nullptr, 0, nullptr);
         if (g_log) CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
