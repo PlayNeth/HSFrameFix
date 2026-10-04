@@ -33,6 +33,8 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.6.6: verified against the original nfs4.exe release (sha256 17a0f96c3bcfb94f...)
+//    as well as the widescreen-patched exe; the log names which one is running.
 //  - v0.6.5: exeCheck=0 patches a modified nfs4.exe anyway; every differing byte
 //    range is logged (expected vs found) either way.
 //  - v0.6.4: menuMaxFPS - menus never run above 128 fps (auto: a divisor of the
@@ -86,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.6.5"
+#define HSFF_VERSION "0.6.6"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -493,7 +495,16 @@ static bool CheckExe() {
         Logf("exe check: 0x%06lX differs (* = changed byte)\n    expected %s\n    found    %s\n",
              (unsigned long)s.addr, exp, got);
     }
-    if (!bad) { Logf("exe check: nfs4.exe matches (%d checks)\n", total); return true; }
+    if (!bad) {
+        // Two known builds share every byte the mod uses: the original 1999 release
+        // (sha256 17a0f96c...) and the same exe with a widescreen patch, which hooks
+        // the projection setup (0x53A086 jmp instead of fstp [0x5B0954]).
+        const BYTE* w = (const BYTE*)0x53A086;
+        const char* variant = (w[0] == 0xD9 && w[1] == 0x1D) ? "original release"
+                            : (w[0] == 0xE9) ? "with widescreen patch" : "unknown variant";
+        Logf("exe check: nfs4.exe matches (%d checks, %s)\n", total, variant);
+        return true;
+    }
     if (g_cfg.exeCheck) {
         Logf("exe check: %d of %d checks differ - not the analysed nfs4.exe, mod disabled "
              "(exeCheck=0 in the ini patches anyway)\n", bad, total);
