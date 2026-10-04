@@ -33,6 +33,8 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.6.4: menuMaxFPS - menus never run above 128 fps (auto: a divisor of the
+//    refresh rate), since several menu animations speed up past the 128 Hz tick.
 //  - v0.6.3: only the menu item reveal timing is changed; the list-slide and FeFx
 //    timers are original again (a zero step made the list slide end early and loop).
 //  - v0.6.2: v0.6.1's menu timing fix froze menu animations when the tick counter
@@ -82,7 +84,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.6.3"
+#define HSFF_VERSION "0.6.4"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -206,6 +208,7 @@ struct Config {
     int   fovKeyReset      = 0x75;  // F6
     int   fovStep          = 1;
     int   glideMenuEffects = 1;
+    int   menuMaxFPS       = -1;    // -1 = auto (<= 128, divides the refresh rate), 0 = none
     int   logToFile        = 1;
     int   logEverySeconds  = 10;
 };
@@ -246,6 +249,12 @@ static const char kGlideBlock[] =
     "; --- menus: the extra effects the game only draws on its Glide renderer (glow on\n"
     ";     menu items, full-brightness highlights, ...), also on Direct3D drivers ---\n"
     "glideMenuEffects=1\n";
+static const char kMenuMaxBlock[] =
+    "; --- menus: frame rate ceiling. The menu code counts time in 1/128 s ticks and some\n"
+    ";     animations (list slide, video walls) speed up above 128 fps.\n"
+    ";     -1 = auto: the highest rate <= 128 that divides your refresh rate (120 Hz -> 120,\n"
+    ";     144 Hz -> 72, 240 Hz -> 120); 0 = no ceiling; N = at most N fps ---\n"
+    "menuMaxFPS=-1\n";
 static char g_iniPath[MAX_PATH] = {};
 
 static void LoadConfig() {
@@ -281,12 +290,13 @@ static void LoadConfig() {
                   "logEverySeconds=10\n", f);
             fputs(kNewKeysBlock, f);
             fputs(kGlideBlock, f);
+            fputs(kMenuMaxBlock, f);
             fclose(f);
         }
         return;
     }
     char line[256];
-    bool sawNew = false, sawGlide = false;
+    bool sawNew = false, sawGlide = false, sawMenuMax = false;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
         char key[64] = {}, val[64] = {};
@@ -313,6 +323,7 @@ static void LoadConfig() {
         else if (!_stricmp(key, "fovKeyReset"))       g_cfg.fovKeyReset = (int)strtol(val, nullptr, 0);
         else if (!_stricmp(key, "fovStep"))           g_cfg.fovStep = atoi(val);
         else if (!_stricmp(key, "glideMenuEffects"))  { g_cfg.glideMenuEffects = atoi(val); sawGlide = true; }
+        else if (!_stricmp(key, "menuMaxFPS"))        { g_cfg.menuMaxFPS = atoi(val); sawMenuMax = true; }
         else if (!_stricmp(key, "logToFile"))         g_cfg.logToFile = atoi(val);
         else if (!_stricmp(key, "logEverySeconds"))   g_cfg.logEverySeconds = atoi(val);
     }
@@ -324,6 +335,10 @@ static void LoadConfig() {
     if (!sawGlide) {
         FILE* a = fopen(path, "a");
         if (a) { fputs("\n", a); fputs(kGlideBlock, a); fclose(a); }
+    }
+    if (!sawMenuMax) {
+        FILE* a = fopen(path, "a");
+        if (a) { fputs("\n", a); fputs(kMenuMaxBlock, a); fclose(a); }
     }
 }
 
@@ -791,8 +806,28 @@ static void Limiter() { LimitTo(g_cfg.targetFPS, g_limNext); }
 
 static LONGLONG g_menuNext = 0;
 static std::atomic<unsigned long> g_menuFrames{0};
+// Menu frame ceiling: auto = the highest rate <= 128 that divides the refresh rate
+// (re-read every 2 s, the game may change display mode).
+static int MenuCeiling() {
+    if (g_cfg.menuMaxFPS >= 0) return g_cfg.menuMaxFPS;
+    static int cached = 0; static DWORD lastCheck = 0;
+    DWORD now = GetTickCount();
+    if (!cached || now - lastCheck > 2000) {
+        lastCheck = now;
+        DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
+        int hz = 0;
+        if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm)) hz = (int)dm.dmDisplayFrequency;
+        if (hz < 30 || hz > 1000) hz = 60;                 // "default"/unknown
+        int c = hz;
+        for (int n = 1; c > 128; n++) c = hz / (n + 1);
+        if (c != cached) { cached = c; LogfAsync("menus: frame ceiling %d fps (display %d Hz)\n", c, hz); }
+    }
+    return cached;
+}
 extern "C" void __cdecl MenuFrame() {
     int fps = g_cfg.menuTargetFPS < 0 ? g_cfg.targetFPS : g_cfg.menuTargetFPS;
+    int cap = MenuCeiling();
+    if (cap > 0 && (fps <= 0 || fps > cap)) fps = cap;
     LimitTo(fps, g_menuNext);
     g_menuFrames++;
 }
