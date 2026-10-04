@@ -33,6 +33,8 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.6.2: v0.6.1's menu timing fix froze menu animations when the tick counter
+//    had been reset (negative elapsed time); negative now resyncs like the original.
 //  - v0.6.1: menu item reveal / glow and two other menu animations no longer run
 //    faster above 64 fps (they counted at least 2 ticks per frame).
 //  - v0.6: glideMenuEffects - the front end's Glide-only effects (menu glow, full
@@ -78,7 +80,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.6.1"
+#define HSFF_VERSION "0.6.2"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -899,6 +901,9 @@ extern "C" void MenuWaitStub();
 extern "C" void LoadBarStub();
 extern "C" void FovStub();
 extern "C" void DashFovStub();
+extern "C" void MenuTimeStub1();
+extern "C" void MenuTimeStub2();
+extern "C" void MenuTimeStub3();
 asm(".text\n"
     // call site of the sim step: run it, then snapshot
     ".globl _StepStub\n"
@@ -999,6 +1004,34 @@ asm(".text\n"
     "    popl %edx\n"
     "    popl %ecx\n"
     "    popfl\n"
+    "    ret\n"
+    // menu animation timers, called in place of "mov [ebp-x], 2" (return redirected)
+    ".globl _MenuTimeStub1\n"
+    "_MenuTimeStub1:\n"
+    "    cmpl $0, -0x14(%ebp)\n"
+    "    jl 1f\n"
+    "    movl $0x4AAFE6, (%esp)\n"
+    "    ret\n"
+    "1:  movl $2, -0x14(%ebp)\n"
+    "    movl $0x4AAFA7, (%esp)\n"
+    "    ret\n"
+    ".globl _MenuTimeStub2\n"
+    "_MenuTimeStub2:\n"
+    "    cmpl $0, -8(%ebp)\n"
+    "    jl 1f\n"
+    "    movl $0x487214, (%esp)\n"
+    "    ret\n"
+    "1:  movl $2, -8(%ebp)\n"
+    "    movl $0x4871DC, (%esp)\n"
+    "    ret\n"
+    ".globl _MenuTimeStub3\n"
+    "_MenuTimeStub3:\n"
+    "    cmpl $0, -0xc(%ebp)\n"
+    "    jl 1f\n"
+    "    movl $0x4AA1AD, (%esp)\n"
+    "    ret\n"
+    "1:  movl $2, -0xc(%ebp)\n"
+    "    movl $0x4AA198, (%esp)\n"
     "    ret\n"
     // replaces "mov edx, 80" in the cockpit draw 0x4D1C80
     ".globl _DashFovStub\n"
@@ -1208,12 +1241,11 @@ static void InstallMenuUnlock() {
     bool ok = PatchRel32(hs::menuWaitAt, 0xE9, (void*)&MenuWaitStub);
     // Three menu animations advance by the 128 Hz ticks since the last frame but
     // count at least 2 (or treat 0 as 2): fine at 64 fps, too fast above it. When
-    // less time has passed, skip the update and let the ticks add up instead.
-    static const BYTE skip1[] = { 0xEB, 0x44, 0x90, 0x90, 0x90, 0x90, 0x90 };  // 0x4AAFA0 -> 0x4AAFE6
-    static const BYTE skip2[] = { 0xEB, 0x3D, 0x90, 0x90, 0x90, 0x90, 0x90 };  // 0x4871D5 -> 0x487214
-    static const BYTE skip3[] = { 0xEB, 0x1A, 0x90, 0x90, 0x90, 0x90, 0x90 };  // 0x4AA191 -> 0x4AA1AD
-    bool ok2 = PatchBytes(0x4AAFA0, skip1, 7) && PatchBytes(0x4871D5, skip2, 7) &&
-               PatchBytes(0x4AA191, skip3, 7);
+    // 0..1 has passed, skip the update and let the ticks add up instead. Negative
+    // (the tick counter was reset) keeps the original "count 2 and resync".
+    bool ok2 = PatchRel32(0x4AAFA0, 0xE8, (void*)&MenuTimeStub1) &&
+               PatchRel32(0x4871D5, 0xE8, (void*)&MenuTimeStub2) &&
+               PatchRel32(0x4AA191, 0xE8, (void*)&MenuTimeStub3);
     Logf("menus: %s, menu animation timing %s\n", ok ? "unlocked" : "patch FAILED",
          ok2 ? "fixed" : "patch FAILED");
 }
