@@ -33,6 +33,16 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.5: loading. The loading bar (0x4E7B80, ~48 calls per race load) does a
+//    full GPU sync (THRASH_sync(0) = lock/unlock) and two vsync'd page flips
+//    every call. speedUpLoading only redraws it every loadScreenRenderMs; the
+//    skipped calls still run its callback poll (0x54A790).
+//    Camera FOV: the game uses one FOV for the whole view, from 0x539E10
+//    (90 deg, 75 with the narrow view-angle option, +15 in some modes). Its
+//    three callers inside the view setup (0x539F80, view in [ebp-4]) are
+//    redirected so a per-camera offset is added (camera type of that view's
+//    active camera; the rear-view mirror is left alone). F6/F7/F8 change the
+//    current camera's offset in race and save it to the ini.
 //  - interpolate: after every sim step it snapshots the transforms of all cars
 //    (pos car+8, rotation car+0x34), all camera objects (pos cam+0x14,
 //    rotation cam+0x2C, table 0x660DF0) and the helicopter (position). Before
@@ -57,7 +67,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.4"
+#define HSFF_VERSION "0.5"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -92,6 +102,11 @@ namespace hs {
     // front end
     const DWORD menuWaitAt      = 0x538185;   // mov eax,[0x9E6D54] - start of the 2-tick wait
     const DWORD menuWaitDone    = 0x5381A9;   // mov eax,[ebp-8] - after the wait
+    // loading bar
+    const DWORD fnLoadBar       = 0x4E7B80;   // void LoadBar(float percent), ret 4
+    // FOV
+    const DWORD fnGetFov        = 0x539E10;   // int GetViewFov()
+    const DWORD callGetFov[3]   = { 0x539FA6, 0x539FCB, 0x539FEB };
     const DWORD pCopterCount    = 0x681DD8;
     const DWORD pCopterList     = 0x681DD4;
 
@@ -130,6 +145,13 @@ namespace hs {
         { 0x538179, "\xFF\x15\xF0\x7F\x9E\x00\xFF\x15\xE0\x7F\x9E\x00\xA1\x54\x6D\x9E\x00"
                     "\x89\x45\xF8\xA1\xBC\xA5\x8A\x00\x83\xC0\x02\x3B\x45\xF8\x7E\x0F"
                     "\xA1\x54\x6D\x9E\x00\x89\x45\xF8\xE8\xB9\xE2\xFE\xFF\xEB\xE4\x8B\x45\xF8", 51 }, // menu present + wait
+        { 0x4E7B80, "\x53\x51\x52\x56\x57\x55\x89\xE5\x83\xEC\x0C\x31\xC0\xE8", 14 },   // loading bar
+        { 0x4E7F8F, "\xC2\x04\x00", 3 },
+        { 0x539E10, "\x52\x55\x89\xE5\x83\xEC\x04\xBA\x5A\x00\x00\x00", 12 },       // GetViewFov (90)
+        { 0x539F8A, "\x89\x45\xFC", 3 },                                      // view -> [ebp-4]
+        { 0x539FA6, "\xE8\x65\xFE\xFF\xFF", 5 },
+        { 0x539FCB, "\xE8\x40\xFE\xFF\xFF", 5 },
+        { 0x539FEB, "\xE8\x20\xFE\xFF\xFF", 5 },
     };
 }
 
@@ -146,6 +168,19 @@ struct Config {
     float interpDelay      = 1.0f;  // how far behind the newest step frames are shown (steps)
     int   unlockMenus      = 1;
     int   menuTargetFPS    = -1;    // -1 = same as targetFPS, 0 = off
+    int   speedUpLoading   = 1;
+    int   loadScreenRenderMs = 100;
+    // camera FOV offsets (degrees added to the game's FOV)
+    int   fovOffset        = 0;
+    int   fovOffsetInCar   = 0;     // camera type 1
+    int   fovOffsetBumper  = 0;     // type 2
+    int   fovOffsetHeli    = 0;     // types 3, 5 (static)
+    int   fovOffsetRoof    = 0;     // types 4, 6 (static)
+    int   fovHotkeys       = 1;
+    int   fovKeyUp         = 0x77;  // F8
+    int   fovKeyDown       = 0x76;  // F7
+    int   fovKeyReset      = 0x75;  // F6
+    int   fovStep          = 1;
     int   logToFile        = 1;
     int   logEverySeconds  = 10;
 };
@@ -164,10 +199,31 @@ static void InitAsiDir() {
     g_asiDir[0] = 0;
 }
 
+static const char kNewKeysBlock[] =
+    "; --- loading: redraw the loading bar at most every N ms (0 = every call) ---\n"
+    "speedUpLoading=1\n"
+    "loadScreenRenderMs=100\n"
+    "; --- camera FOV (degrees added to the game's FOV; negative = narrower) ---\n"
+    "; fovOffset applies to every race camera, the others to one camera each\n"
+    "fovOffset=0\n"
+    "fovOffsetInCar=0\n"
+    "fovOffsetBumper=0\n"
+    "fovOffsetHeli=0\n"
+    "fovOffsetRoof=0\n"
+    "; in race: F8 = wider, F7 = narrower, F6 = reset, for the camera you're in (saved here)\n"
+    "; keys are Windows virtual-key codes (F1..F12 = 0x70..0x7B; avoid F10)\n"
+    "fovHotkeys=1\n"
+    "fovKeyUp=0x77\n"
+    "fovKeyDown=0x76\n"
+    "fovKeyReset=0x75\n"
+    "fovStep=1\n";
+static char g_iniPath[MAX_PATH] = {};
+
 static void LoadConfig() {
     InitAsiDir();
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%sHSFrameFix.ini", g_asiDir);
+    strcpy(g_iniPath, path);
     FILE* f = fopen(path, "r");
     if (!f) {
         f = fopen(path, "w");
@@ -194,11 +250,13 @@ static void LoadConfig() {
                   "menuTargetFPS=-1\n"
                   "logToFile=1\n"
                   "logEverySeconds=10\n", f);
+            fputs(kNewKeysBlock, f);
             fclose(f);
         }
         return;
     }
     char line[256];
+    bool sawNew = false;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
         char key[64] = {}, val[64] = {};
@@ -212,10 +270,26 @@ static void LoadConfig() {
         else if (!_stricmp(key, "interpDelay"))       g_cfg.interpDelay = (float)atof(val);
         else if (!_stricmp(key, "unlockMenus"))       g_cfg.unlockMenus = atoi(val);
         else if (!_stricmp(key, "menuTargetFPS"))     g_cfg.menuTargetFPS = atoi(val);
+        else if (!_stricmp(key, "speedUpLoading"))    { g_cfg.speedUpLoading = atoi(val); sawNew = true; }
+        else if (!_stricmp(key, "loadScreenRenderMs")) g_cfg.loadScreenRenderMs = atoi(val);
+        else if (!_stricmp(key, "fovOffset"))         g_cfg.fovOffset = atoi(val);
+        else if (!_stricmp(key, "fovOffsetInCar"))    g_cfg.fovOffsetInCar = atoi(val);
+        else if (!_stricmp(key, "fovOffsetBumper"))   g_cfg.fovOffsetBumper = atoi(val);
+        else if (!_stricmp(key, "fovOffsetHeli"))     g_cfg.fovOffsetHeli = atoi(val);
+        else if (!_stricmp(key, "fovOffsetRoof"))     g_cfg.fovOffsetRoof = atoi(val);
+        else if (!_stricmp(key, "fovHotkeys"))        g_cfg.fovHotkeys = atoi(val);
+        else if (!_stricmp(key, "fovKeyUp"))          g_cfg.fovKeyUp = (int)strtol(val, nullptr, 0);
+        else if (!_stricmp(key, "fovKeyDown"))        g_cfg.fovKeyDown = (int)strtol(val, nullptr, 0);
+        else if (!_stricmp(key, "fovKeyReset"))       g_cfg.fovKeyReset = (int)strtol(val, nullptr, 0);
+        else if (!_stricmp(key, "fovStep"))           g_cfg.fovStep = atoi(val);
         else if (!_stricmp(key, "logToFile"))         g_cfg.logToFile = atoi(val);
         else if (!_stricmp(key, "logEverySeconds"))   g_cfg.logEverySeconds = atoi(val);
     }
     fclose(f);
+    if (!sawNew) {                        // ini from an older version: add the new keys
+        FILE* a = fopen(path, "a");
+        if (a) { fputs("\n", a); fputs(kNewKeysBlock, a); fclose(a); }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -643,7 +717,9 @@ extern "C" void __cdecl MenuFrame() {
     g_menuFrames++;
 }
 
+static void FovHotkeys();
 extern "C" void __cdecl PreRender() {
+    FovHotkeys();
     Limiter();
     g_renders++;
     g_applied = false;
@@ -739,6 +815,8 @@ extern "C" void StepStub();
 extern "C" void RenderStub();
 extern "C" void ExtraRenderStub();
 extern "C" void MenuWaitStub();
+extern "C" void LoadBarStub();
+extern "C" void FovStub();
 asm(".text\n"
     // call site of the sim step: run it, then snapshot
     ".globl _StepStub\n"
@@ -799,13 +877,206 @@ asm(".text\n"
     "    movl 0x9E6D54, %eax\n"
     "    movl %eax, -8(%ebp)\n"
     "    pushl $0x5381A9\n"
+    "    ret\n"
+    // entry of the loading bar (stack: ret, float percent)
+    ".globl _LoadBarStub\n"
+    "_LoadBarStub:\n"
+    "    pushfl\n"
+    "    pushal\n"
+    "    pushl 40(%esp)\n"            // percent
+    "    call _LoadBarDecide\n"
+    "    addl $4, %esp\n"
+    "    popal\n"
+    "    popfl\n"
+    "    cmpl $0, _g_loadDraw\n"
+    "    jne 3f\n"
+    "    pushal\n"                    // skipped: keep the callback poll it starts with
+    "    xorl %eax, %eax\n"
+    "    call *_g_fnPoll\n"
+    "    popal\n"
+    "    ret $4\n"
+    "3:  pushl %ebx\n"                 // original prologue, then continue
+    "    pushl %ecx\n"
+    "    pushl %edx\n"
+    "    pushl %esi\n"
+    "    pushl %edi\n"
+    "    pushl %ebp\n"
+    "    pushl $0x4E7B86\n"
+    "    ret\n"
+    // calls to GetViewFov inside the view setup 0x539F80 (view in [ebp-4])
+    ".globl _FovStub\n"
+    "_FovStub:\n"
+    "    call *_g_fnGetFov\n"
+    "    pushfl\n"
+    "    pushl %ecx\n"
+    "    pushl %edx\n"
+    "    pushl -4(%ebp)\n"
+    "    pushl %eax\n"
+    "    call _FovAdjust\n"
+    "    addl $8, %esp\n"
+    "    popl %edx\n"
+    "    popl %ecx\n"
+    "    popfl\n"
     "    ret\n");
+
+// ---------------------------------------------------------------------------
+// Loading bar throttle
+// ---------------------------------------------------------------------------
+extern "C" { int g_loadDraw = 1; DWORD g_fnPoll = 0x54A790, g_fnGetFov = 0x539E10; }
+static LONGLONG g_loadLastCall = 0, g_loadLastDraw = 0, g_loadStart = 0;
+static unsigned long g_loadCalls = 0, g_loadDraws = 0;
+static bool g_loadActive = false;
+static CRITICAL_SECTION g_loadLock;
+
+extern "C" void __cdecl LoadBarDecide(float pct) {
+    LONGLONG now = Qpc();
+    EnterCriticalSection(&g_loadLock);
+    if (!g_loadActive || now - g_loadLastCall > 2 * g_qpf.QuadPart) {   // new load
+        g_loadActive = true; g_loadStart = now; g_loadCalls = 0; g_loadDraws = 0; g_loadLastDraw = 0;
+    }
+    g_loadLastCall = now;
+    g_loadCalls++;
+    LONGLONG minGap = (LONGLONG)g_cfg.loadScreenRenderMs * g_qpf.QuadPart / 1000;
+    bool draw = !g_cfg.speedUpLoading || g_cfg.loadScreenRenderMs <= 0 || !g_loadLastDraw ||
+                pct >= 100.0f || now - g_loadLastDraw >= minGap;
+    if (draw) { g_loadLastDraw = now; g_loadDraws++; }
+    g_loadDraw = draw ? 1 : 0;
+    LeaveCriticalSection(&g_loadLock);
+}
+static void LoadStatsTick() {                 // called by the stats thread
+    EnterCriticalSection(&g_loadLock);
+    if (g_loadActive && Qpc() - g_loadLastCall > 2 * g_qpf.QuadPart) {
+        Logf("load: %lu loading-bar updates, %lu drawn, first->last %.0f ms\n", g_loadCalls,
+             g_loadDraws, QpcMs(g_loadLastCall - g_loadStart));
+        g_loadActive = false;
+    }
+    LeaveCriticalSection(&g_loadLock);
+}
+
+// ---------------------------------------------------------------------------
+// Camera FOV
+// ---------------------------------------------------------------------------
+static int* FovSlot(int type) {
+    switch (type) {
+        case 1: return &g_cfg.fovOffsetInCar;
+        case 2: return &g_cfg.fovOffsetBumper;
+        case 3: case 5: return &g_cfg.fovOffsetHeli;
+        case 4: case 6: return &g_cfg.fovOffsetRoof;
+    }
+    return nullptr;
+}
+static const char* FovKey(int type) {
+    switch (type) {
+        case 1: return "fovOffsetInCar";
+        case 2: return "fovOffsetBumper";
+        case 3: case 5: return "fovOffsetHeli";
+        case 4: case 6: return "fovOffsetRoof";
+    }
+    return "fovOffset";
+}
+static const char* FovName(int type) {
+    switch (type) {
+        case 1: return "in-car"; case 2: return "bumper"; case 3: return "heli";
+        case 4: return "roof"; case 5: return "static heli"; case 6: return "static roof";
+    }
+    return "other";
+}
+static std::atomic<int> g_fovLastType{-1};
+static unsigned g_fovSeen = 0;
+
+static int CameraTypeForView(DWORD view) {
+    if (!view || IsBadReadPtr((void*)view, 8)) return -1;
+    long vidx = Rd<long>(view + 4);
+    if (Rd<long>(0x7C4BEC) == 1) vidx &= 1; else vidx = 0;   // same rule as the camera code
+    DWORD cam = EffectiveCam((int)vidx);
+    if (!cam || IsBadReadPtr((void*)cam, 4)) return -1;
+    return Rd<long>(cam);
+}
+
+extern "C" int __cdecl FovAdjust(int fov, DWORD view) {
+    if (!view || IsBadReadPtr((void*)view, 8) || Rd<long>(view) == 1) return fov;   // mirror
+    int type = CameraTypeForView(view);
+    int add = g_cfg.fovOffset;
+    if (int* p = FovSlot(type)) add += *p;
+    if (type >= 0 && type < 32 && !(g_fovSeen & (1u << type))) {
+        g_fovSeen |= 1u << type;
+        Logf("camera type %d (%s): game FOV %d, offset %+d\n", type, FovName(type), fov, add);
+    }
+    g_fovLastType = type;
+    int f = fov + add;
+    if (f < 20) f = 20;
+    if (f > 150) f = 150;
+    return f;
+}
+
+static void ReplaceIniLine(const char* key, int value) {
+    if (!g_iniPath[0]) return;
+    FILE* f = fopen(g_iniPath, "r");
+    if (!f) return;
+    static char buf[32768];
+    size_t n = 0; char line[256]; bool done = false; size_t kl = strlen(key);
+    while (fgets(line, sizeof(line), f)) {
+        char out[256];
+        const char* p = line; while (*p == ' ' || *p == '\t') p++;
+        if (!done && !_strnicmp(p, key, kl) && (p[kl] == '=' || p[kl] == ' ' || p[kl] == '\t')) {
+            snprintf(out, sizeof(out), "%s=%d\n", key, value); done = true;
+        } else snprintf(out, sizeof(out), "%s", line);
+        size_t l = strlen(out);
+        if (n + l < sizeof(buf)) { memcpy(buf + n, out, l); n += l; }
+    }
+    fclose(f);
+    if (!done) { char out[128]; snprintf(out, sizeof(out), "%s=%d\n", key, value);
+                 size_t l = strlen(out); if (n + l < sizeof(buf)) { memcpy(buf + n, out, l); n += l; } }
+    f = fopen(g_iniPath, "w");
+    if (f) { fwrite(buf, 1, n, f); fclose(f); }
+}
+
+static bool GameHasFocus() {
+    HWND w = GetForegroundWindow(); DWORD pid = 0;
+    if (w) GetWindowThreadProcessId(w, &pid);
+    return pid == GetCurrentProcessId();
+}
+static void FovHotkeys() {
+    if (!g_cfg.fovHotkeys) return;
+    static bool prev[3] = {};
+    const int keys[3] = { g_cfg.fovKeyUp, g_cfg.fovKeyDown, g_cfg.fovKeyReset };
+    bool focus = GameHasFocus();
+    for (int k = 0; k < 3; k++) {
+        bool down = focus && keys[k] > 0 && keys[k] < 256 && (GetAsyncKeyState(keys[k]) & 0x8000);
+        if (down && !prev[k]) {
+            int type = g_fovLastType;
+            int* slot = FovSlot(type);
+            if (!slot) slot = &g_cfg.fovOffset;
+            if (k == 0) *slot += g_cfg.fovStep; else if (k == 1) *slot -= g_cfg.fovStep; else *slot = 0;
+            if (*slot > 60) *slot = 60;
+            if (*slot < -50) *slot = -50;
+            ReplaceIniLine(FovSlot(type) ? FovKey(type) : "fovOffset", *slot);
+            Logf("FOV hotkey: %s offset now %+d\n", FovSlot(type) ? FovName(type) : "global", *slot);
+        }
+        prev[k] = down;
+    }
+}
 
 static void InstallMenuUnlock() {
     if (!g_knownExe || !g_cfg.unlockMenus) { Logf("menus: original 64 fps cap\n"); return; }
     if (!g_limTimer) g_limTimer = CreateHiResTimer();
     bool ok = PatchRel32(hs::menuWaitAt, 0xE9, (void*)&MenuWaitStub);
     Logf("menus: %s\n", ok ? "unlocked" : "patch FAILED");
+}
+
+static void InstallLoadingAndFov() {
+    InitializeCriticalSection(&g_loadLock);
+    if (!g_knownExe) return;
+    if (g_cfg.speedUpLoading) {
+        bool ok = PatchRel32(hs::fnLoadBar, 0xE9, (void*)&LoadBarStub);
+        Logf("loading: %s (loading bar redrawn at most every %d ms)\n",
+             ok ? "sped up" : "patch FAILED", g_cfg.loadScreenRenderMs);
+    } else Logf("loading: original\n");
+    bool ok = true;
+    for (DWORD at : hs::callGetFov) ok &= PatchRel32(at, 0xE8, (void*)&FovStub);
+    Logf("camera FOV: %s (all %+d, in-car %+d, bumper %+d, heli %+d, roof %+d, hotkeys %s)\n",
+         ok ? "hooked" : "patch FAILED", g_cfg.fovOffset, g_cfg.fovOffsetInCar, g_cfg.fovOffsetBumper,
+         g_cfg.fovOffsetHeli, g_cfg.fovOffsetRoof, g_cfg.fovHotkeys ? "on" : "off");
 }
 
 static void InstallInterpolation() {
@@ -830,6 +1101,7 @@ static DWORD WINAPI StatsThread(LPVOID) {
     for (;;) {
         int sec = g_cfg.logEverySeconds > 0 ? g_cfg.logEverySeconds : 10;
         Sleep(sec * 1000);
+        LoadStatsTick();
         unsigned long mf = g_menuFrames;
         if (mf != lmf) Logf("last %ds: menu frames %.1f/s\n", sec, (mf - lmf) / (double)sec);
         lmf = mf;
@@ -860,6 +1132,7 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
         InstallTickScheduler();
         InstallInterpolation();
         InstallMenuUnlock();
+        InstallLoadingAndFov();
         if (g_log) CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
         if (reserved) g_logLockInit = false;
