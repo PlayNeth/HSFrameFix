@@ -33,6 +33,8 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.5.1: the cockpit model (0x4D1C80) uses its own fixed 80 degree FOV; it now
+//    scales with the in-car FOV offset so the dashboard widens with the world.
 //  - v0.5: loading. The loading bar (0x4E7B80, ~48 calls per race load) does a
 //    full GPU sync (THRASH_sync(0) = lock/unlock) and two vsync'd page flips
 //    every call. speedUpLoading only redraws it every loadScreenRenderMs; the
@@ -67,7 +69,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.5"
+#define HSFF_VERSION "0.5.1"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -107,6 +109,7 @@ namespace hs {
     // FOV
     const DWORD fnGetFov        = 0x539E10;   // int GetViewFov()
     const DWORD callGetFov[3]   = { 0x539FA6, 0x539FCB, 0x539FEB };
+    const DWORD dashFovAt       = 0x4D1DA8;   // mov edx, 80 -> cockpit projection FOV
     const DWORD pCopterCount    = 0x681DD8;
     const DWORD pCopterList     = 0x681DD4;
 
@@ -148,6 +151,7 @@ namespace hs {
         { 0x4E7B80, "\x53\x51\x52\x56\x57\x55\x89\xE5\x83\xEC\x0C\x31\xC0\xE8", 14 },   // loading bar
         { 0x4E7F8F, "\xC2\x04\x00", 3 },
         { 0x539E10, "\x52\x55\x89\xE5\x83\xEC\x04\xBA\x5A\x00\x00\x00", 12 },       // GetViewFov (90)
+        { 0x4D1DA8, "\xBA\x50\x00\x00\x00\xB8\x10\x3A\x85\x00", 10 },          // cockpit FOV 80
         { 0x539F8A, "\x89\x45\xFC", 3 },                                      // view -> [ebp-4]
         { 0x539FA6, "\xE8\x65\xFE\xFF\xFF", 5 },
         { 0x539FCB, "\xE8\x40\xFE\xFF\xFF", 5 },
@@ -817,6 +821,7 @@ extern "C" void ExtraRenderStub();
 extern "C" void MenuWaitStub();
 extern "C" void LoadBarStub();
 extern "C" void FovStub();
+extern "C" void DashFovStub();
 asm(".text\n"
     // call site of the sim step: run it, then snapshot
     ".globl _StepStub\n"
@@ -917,6 +922,18 @@ asm(".text\n"
     "    popl %edx\n"
     "    popl %ecx\n"
     "    popfl\n"
+    "    ret\n"
+    // replaces "mov edx, 80" in the cockpit draw 0x4D1C80
+    ".globl _DashFovStub\n"
+    "_DashFovStub:\n"
+    "    pushfl\n"
+    "    pushl %eax\n"
+    "    pushl %ecx\n"
+    "    call _DashFov\n"
+    "    movl %eax, %edx\n"
+    "    popl %ecx\n"
+    "    popl %eax\n"
+    "    popfl\n"
     "    ret\n");
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1000,7 @@ static const char* FovName(int type) {
 }
 static std::atomic<int> g_fovLastType{-1};
 static unsigned g_fovSeen = 0;
+static volatile int g_fovGame = 90, g_fovAdj = 90;   // last non-mirror view: game FOV, our FOV
 
 static int CameraTypeForView(DWORD view) {
     if (!view || IsBadReadPtr((void*)view, 8)) return -1;
@@ -1006,6 +1024,23 @@ extern "C" int __cdecl FovAdjust(int fov, DWORD view) {
     int f = fov + add;
     if (f < 20) f = 20;
     if (f > 150) f = 150;
+    g_fovGame = fov; g_fovAdj = f;
+    return f;
+}
+
+// The cockpit model is drawn in its own pass with a fixed 80 degree FOV, on top of
+// the world. Scale it by the same tan ratio as the world so both stay aligned.
+extern "C" int __cdecl DashFov() {
+    const int base = 80;
+    int g = g_fovGame, a = g_fovAdj;
+    if (g == a || g <= 0 || g >= 180 || a <= 0 || a >= 180) return base;
+    const double d2r = 3.14159265358979 / 360.0;   // degrees -> half-angle radians
+    double t = tan(base * d2r) * tan(a * d2r) / tan(g * d2r);
+    int f = (int)floor(atan(t) / d2r + 0.5);
+    if (f < 20) f = 20;
+    if (f > 170) f = 170;
+    static int logged = -1;
+    if (f != logged) { logged = f; Logf("cockpit FOV %d (world %d -> %d)\n", f, g, a); }
     return f;
 }
 
@@ -1074,6 +1109,7 @@ static void InstallLoadingAndFov() {
     } else Logf("loading: original\n");
     bool ok = true;
     for (DWORD at : hs::callGetFov) ok &= PatchRel32(at, 0xE8, (void*)&FovStub);
+    ok &= PatchRel32(hs::dashFovAt, 0xE8, (void*)&DashFovStub);
     Logf("camera FOV: %s (all %+d, in-car %+d, bumper %+d, heli %+d, roof %+d, hotkeys %s)\n",
          ok ? "hooked" : "patch FAILED", g_cfg.fovOffset, g_cfg.fovOffsetInCar, g_cfg.fovOffsetBumper,
          g_cfg.fovOffsetHeli, g_cfg.fovOffsetRoof, g_cfg.fovHotkeys ? "on" : "off");
