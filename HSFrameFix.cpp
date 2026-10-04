@@ -33,6 +33,8 @@
 //    unlockMenus replaces that wait with one idle call per frame (plus the
 //    optional limiter), so menus run at the display's refresh rate. Menu
 //    animations are driven by the tick counter, so their speed is unchanged.
+//  - v0.5.3: crash / recovery cameras keep the FOV offset of the camera the player
+//    picked ([0x7C3CA8+view*4]) instead of falling back to the global offset only.
 //  - v0.5.2: FOV hotkeys no longer write the ini / log on the game thread (a
 //    background thread saves them), so a burst of key presses can't stall a frame.
 //    The log now says when clamped frames happened.
@@ -72,7 +74,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.5.2"
+#define HSFF_VERSION "0.5.3"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -112,6 +114,7 @@ namespace hs {
     // FOV
     const DWORD fnGetFov        = 0x539E10;   // int GetViewFov()
     const DWORD callGetFov[3]   = { 0x539FA6, 0x539FCB, 0x539FEB };
+    const DWORD pSelectedCam    = 0x7C3CA8;   // camera type the player picked, per view
     const DWORD dashFovAt       = 0x4D1DA8;   // mov edx, 80 -> cockpit projection FOV
     const DWORD pCopterCount    = 0x681DD8;
     const DWORD pCopterList     = 0x681DD4;
@@ -155,6 +158,7 @@ namespace hs {
         { 0x4E7F8F, "\xC2\x04\x00", 3 },
         { 0x539E10, "\x52\x55\x89\xE5\x83\xEC\x04\xBA\x5A\x00\x00\x00", 12 },       // GetViewFov (90)
         { 0x4D1DA8, "\xBA\x50\x00\x00\x00\xB8\x10\x3A\x85\x00", 10 },          // cockpit FOV 80
+        { 0x43DEBE, "\x89\x04\x95\xA8\x3C\x7C\x00", 7 },                       // selected camera slot
         { 0x539F8A, "\x89\x45\xFC", 3 },                                      // view -> [ebp-4]
         { 0x539FA6, "\xE8\x65\xFE\xFF\xFF", 5 },
         { 0x539FCB, "\xE8\x40\xFE\xFF\xFF", 5 },
@@ -1054,10 +1058,11 @@ static unsigned g_fovSeen = 0;
 static volatile LONG g_iniDirty = 0;
 static volatile int g_fovGame = 90, g_fovAdj = 90;   // last non-mirror view: game FOV, our FOV
 
-static int CameraTypeForView(DWORD view) {
+static int CameraTypeForView(DWORD view, long* vidxOut = nullptr) {
     if (!view || IsBadReadPtr((void*)view, 8)) return -1;
     long vidx = Rd<long>(view + 4);
     if (Rd<long>(0x7C4BEC) == 1) vidx &= 1; else vidx = 0;   // same rule as the camera code
+    if (vidxOut) *vidxOut = vidx;
     DWORD cam = EffectiveCam((int)vidx);
     if (!cam || IsBadReadPtr((void*)cam, 4)) return -1;
     return Rd<long>(cam);
@@ -1065,14 +1070,26 @@ static int CameraTypeForView(DWORD view) {
 
 extern "C" int __cdecl FovAdjust(int fov, DWORD view) {
     if (!view || IsBadReadPtr((void*)view, 8) || Rd<long>(view) == 1) return fov;   // mirror
-    int type = CameraTypeForView(view);
+    long vidx = 0;
+    int type = CameraTypeForView(view, &vidx);
+    // Crash / recovery / other game-driven cameras: keep the offset of the camera
+    // the player picked (the game restores that one afterwards, 0x43DEA0).
+    int offType = type;
+    if (!FovSlot(type)) {
+        int sel = Rd<long>(hs::pSelectedCam + vidx * 4);
+        if (FovSlot(sel)) offType = sel;
+    }
     int add = g_cfg.fovOffset;
-    if (int* p = FovSlot(type)) add += *p;
+    if (int* p = FovSlot(offType)) add += *p;
     if (type >= 0 && type < 32 && !(g_fovSeen & (1u << type))) {
         g_fovSeen |= 1u << type;
-        LogfAsync("camera type %d (%s): game FOV %d, offset %+d\n", type, FovName(type), fov, add);
+        if (offType != type)
+            LogfAsync("camera type %d (%s): game FOV %d, offset %+d (from the selected %s camera)\n",
+                      type, FovName(type), fov, add, FovName(offType));
+        else
+            LogfAsync("camera type %d (%s): game FOV %d, offset %+d\n", type, FovName(type), fov, add);
     }
-    g_fovLastType = type;
+    g_fovLastType = offType;
     int f = fov + add;
     if (f < 20) f = 20;
     if (f > 150) f = 150;
