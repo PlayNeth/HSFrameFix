@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.6"
+#define HSFF_VERSION "0.7.7"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1464,6 +1464,7 @@ static volatile bool g_xf = false;
 static float g_xsx = 1, g_xsy = 1, g_xox = 0, g_xoy = 0;
 static int   g_realW = 0, g_realH = 0, g_realBpp = 16;
 static int   g_feCall = 0, g_feTarget = 0, g_curRealIdx = 0;
+static bool  g_softDriver = false;
 static std::atomic<unsigned long> g_wsXfDraws{0}, g_wsBarClears{0}, g_wsMovieFrames{0};
 // race
 static float g_projR = 1.0f;                   // Hor+ factor of the view being set up
@@ -1648,7 +1649,7 @@ static void __stdcall WrUnlock(int a) {
 }
 static int __stdcall WrSetMode(int idx, int a2, int bppCode) {
     int use = idx;
-    if (g_feCall && g_cfg.wsMenus && g_feTarget <= 0 && g_dispW) {
+    if (g_feCall && g_cfg.wsMenus && !g_softDriver && g_feTarget <= 0 && g_dispW) {
         g_feTarget = FindMode(g_dispW, g_dispH);       // mode list may only be ready now
         if (g_cfg.wsLog) {
             BYTE* a = g_tAbout ? (BYTE*)g_tAbout() : nullptr;
@@ -1685,7 +1686,12 @@ static FARPROC WINAPI HkGetProcAddress(HMODULE m, LPCSTR name) {
     if (m != g_thrashMod) {
         g_thrashMod = m;
         char fn[MAX_PATH] = {}; GetModuleFileNameA(m, fn, MAX_PATH);
-        Logf("widescreen: renderer driver %s\n", fn);
+        // the software renderer draws screen-aligned textured quads as unscaled
+        // blits, so scaled menus come apart: keep its menus in their own mode
+        const char* b = strrchr(fn, '\\'); b = b ? b + 1 : fn;
+        g_softDriver = !_strnicmp(b, "soft", 4);
+        Logf("widescreen: renderer driver %s%s\n", fn,
+             g_softDriver && g_cfg.wsMenus ? " (software renderer: menus stay 640x480)" : "");
     }
     struct W { const char* n; void** real; void* wr; };
     static const W kW[] = {
@@ -1718,7 +1724,7 @@ extern "C" { DWORD g_wsFnSetMode = 0x51A710, g_wsFnSelMode = 0x487840, g_wsSelRe
 extern "C" void WsCallSelMode();
 extern "C" void __cdecl WsBeforeFeMode() {
     g_feCall = 1; g_feTarget = 0;
-    if (!g_cfg.wsMenus) return;
+    if (!g_cfg.wsMenus || g_softDriver) return;
     int t = 0, w = 0, h = 0;
     if (g_cfg.wsMenuResolution != 2) {
         WsCallSelMode();
@@ -1735,7 +1741,7 @@ extern "C" void __cdecl WsBeforeFeMode() {
 extern "C" void __cdecl WsAfterFeMode() {
     g_feCall = 0;
     int W = g_realW, H = g_realH;
-    bool on = g_cfg.wsMenus && W > 0 && H > 0 && (W != 640 || H != 480);
+    bool on = g_cfg.wsMenus && !g_softDriver && W > 0 && H > 0 && (W != 640 || H != 480);
     if (on) {
         if (g_cfg.wsMenus == 2) { g_xsx = W / 640.0f; g_xsy = H / 480.0f; g_xox = g_xoy = 0; }
         else {
