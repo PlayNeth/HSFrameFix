@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.1"
+#define HSFF_VERSION "0.7.2"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1638,6 +1638,14 @@ static void __stdcall WrUnlock(int a) {
 }
 static int __stdcall WrSetMode(int idx, int a2, int bppCode) {
     int use = idx;
+    if (g_feCall && g_cfg.wsMenus && g_feTarget <= 0 && g_dispW) {
+        g_feTarget = FindMode(g_dispW, g_dispH);       // mode list may only be ready now
+        if (g_cfg.wsLog) {
+            BYTE* a = g_tAbout ? (BYTE*)g_tAbout() : nullptr;
+            Logf("widescreen: menu mode from the desktop: %d (%d modes listed)\n", g_feTarget,
+                 a && !IsBadReadPtr(a, 0x44) ? *(int*)(a + 0x3C) : -1);
+        }
+    }
     if (g_feCall && g_feTarget > 0) use = g_feTarget;
     int r = g_tSetMode(use, a2, bppCode);
     int w = 0, h = 0, bpp = 16;
@@ -1699,6 +1707,7 @@ extern "C" void __cdecl WsBeforeFeMode() {
     }
     if (!t && g_dispW) t = FindMode(g_dispW, g_dispH);
     g_feTarget = t;
+    if (g_cfg.wsLog) Logf("widescreen: menu mode wanted: %d (race mode setting %lu)\n", t, (unsigned long)g_wsSelResult);
 }
 extern "C" void __cdecl WsAfterFeMode() {
     g_feCall = 0;
