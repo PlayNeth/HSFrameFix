@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.3"
+#define HSFF_VERSION "0.7.4"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1639,7 +1639,7 @@ static unsigned g_lockLogged = 0;
 static void __stdcall WrUnlock(int a) {
     if (g_xf && g_lockInfo && g_cfg.wsMovies && !IsBadReadPtr(g_lockInfo, 8)) {
         if (g_lockLogged < 8) { g_lockLogged++; Logf("widescreen: frame lock from 0x%06lX in the menus\n", (unsigned long)g_lockRet); }
-        if (g_lockRet == 0x5807E9) ScaleLockedFrame();        // movie player
+        if (g_lockRet == 0x5807E9 || g_lockRet == 0x574011) ScaleLockedFrame();   // movie player
     }
     g_lockInfo = nullptr;
     g_tUnlock(a);
@@ -1655,6 +1655,16 @@ static int __stdcall WrSetMode(int idx, int a2, int bppCode) {
         }
     }
     if (g_feCall && g_feTarget > 0) use = g_feTarget;
+    if (use != idx) {
+        // keep the colour depth the game would have had in its own mode: the movie
+        // player writes pixels in that format into the locked frame
+        int gb = 16, rb = 16, req = bppCode == 2 ? 32 : 16;
+        if (ModeEntry(idx, nullptr, nullptr, &gb) && ModeEntry(use, nullptr, nullptr, &rb)) {
+            int eff = req <= gb ? req : 16;
+            if (eff > rb) eff = 16;
+            bppCode = eff == 32 ? 2 : 1;
+        }
+    }
     int r = g_tSetMode(use, a2, bppCode);
     g_curRealIdx = use;
     int w = 0, h = 0, bpp = 16;
@@ -1662,7 +1672,7 @@ static int __stdcall WrSetMode(int idx, int a2, int bppCode) {
         int req = bppCode == 2 ? 32 : 16;
         g_realW = w; g_realH = h; g_realBpp = req <= bpp ? req : 16;
     }
-    if (g_cfg.wsLog) Logf("widescreen: display mode %d -> %dx%d (game asked for mode %d)\n", use, g_realW, g_realH, idx);
+    if (g_cfg.wsLog) Logf("widescreen: display mode %d -> %dx%d, %d bit (game asked for mode %d)\n", use, g_realW, g_realH, g_realBpp, idx);
     return r;
 }
 typedef FARPROC (WINAPI *GPA_t)(HMODULE, LPCSTR);
