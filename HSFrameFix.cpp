@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.8"
+#define HSFF_VERSION "0.7.10"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1432,6 +1432,8 @@ namespace ws {
     const DWORD zoomStore       = 0x53A04C;             // fstp [0x5B0950] (6 bytes)
     const DWORD pFocalX = 0x5B0950, pFocalY = 0x5B0954;
     const DWORD hudWidthLoad    = 0x4CE753;             // fild [0x853A98] (6 bytes)
+    const DWORD hudFitW[2]      = { 0x4D2737, 0x4D28F6 };  // fild [0x853A98]: position / lap list width -> fraction
+    const DWORD hudFontWLoad    = 0x4CE5EB;             // mov eax, [0x853A98] (5 bytes): HUD text sizes
     const DWORD hudInv640[3]    = { 0x59967F, 0x5998CB, 0x599953 };
     const DWORD hudSizes[3]     = { 0x599CCB, 0x599CD7, 0x599CDB };
     const DWORD hudX224[2]      = { 0x4D0A30, 0x4D0B66 }; // float immediates (224.0)
@@ -1766,6 +1768,7 @@ static void ApplyHud(int W, int H) {
     float x224 = 224.0f + (640.0f * k - 640.0f) * 0.5f;
     for (DWORD at : ws::hudX224) PatchBytes(at, &x224, 4);
 }
+extern "C" int __cdecl WsFontW();
 extern "C" void __cdecl WsAfterRaceMode() {
     int W = Rd<int>(ws::pModeW), H = Rd<int>(ws::pModeH);
     if (W > 0 && H > 0 && (W != g_cfg.wsRaceWidth || H != g_cfg.wsRaceHeight)) {
@@ -1773,8 +1776,8 @@ extern "C" void __cdecl WsAfterRaceMode() {
         ReplaceIniLine("wsRaceWidth", W); ReplaceIniLine("wsRaceHeight", H);
     }
     ApplyHud(W, H);
-    if (g_cfg.wsLog) Logf("widescreen: race at %dx%d - HUD lays out %.0f wide, Hor+ %s\n",
-                          W, H, g_hudW, g_cfg.wsFixFOV ? "on" : "off");
+    if (g_cfg.wsLog) Logf("widescreen: race at %dx%d - HUD lays out %.0f wide (text %d), Hor+ %s\n",
+                          W, H, g_hudW, WsFontW(), g_cfg.wsFixFOV ? "on" : "off");
 }
 
 // HUD rectangles from the layout file: [i*5+j] = 4 fractions (y0,x0,y1,x1) then
@@ -1849,6 +1852,13 @@ extern "C" void WsRaceModeStub();
 extern "C" void WsFrustumStub();
 extern "C" void WsZoomStub();
 extern "C" void WsRectsStub();
+extern "C" void WsFontWStub();
+// HUD text sizes scale with the screen width: use the 4:3 width so text fits its boxes
+extern "C" int __cdecl WsFontW() {
+    int W = Rd<int>(ws::pScrW), H = Rd<int>(ws::pScrH);
+    if (g_cfg.wsHud && W > 0 && H > 0 && W * 3 > H * 4 + 2) return (int)lrintf(H * 4.0f / 3.0f);
+    return W;
+}
 asm(".text\n"
     ".globl _WsCallSelMode\n"
     "_WsCallSelMode:\n"
@@ -1925,6 +1935,15 @@ asm(".text\n"
     "    call *%eax\n"
     "    call _WsPostRects\n"
     "    popal\n"
+    "    ret\n"
+    // replaces "mov eax, [0x853A98]" in the HUD text size setup 0x4CE5E0
+    ".globl _WsFontWStub\n"
+    "_WsFontWStub:\n"
+    "    pushl %ecx\n"
+    "    pushl %edx\n"
+    "    call _WsFontW\n"
+    "    popl %edx\n"
+    "    popl %ecx\n"
     "    ret\n");
 
 static void InstallWidescreen() {
@@ -1964,7 +1983,9 @@ static void InstallWidescreen() {
         BYTE f[6] = { 0xD9, 0x05, 0, 0, 0, 0 };          // fld dword [g_hudW]
         DWORD a = (DWORD)&g_hudW; memcpy(f + 2, &a, 4);
         ok &= PatchBytes(ws::hudWidthLoad, f, 6);
+        for (DWORD at : ws::hudFitW) if (*(WORD*)at == 0x05DB) ok &= PatchBytes(at, f, 6);
         ok &= PatchRel32(ws::callRects, 0xE8, (void*)&WsRectsStub);
+        if (*(BYTE*)ws::hudFontWLoad == 0xA1) ok &= PatchRel32(ws::hudFontWLoad, 0xE8, (void*)&WsFontWStub);
         g_hudPatched = true;
         g_hudW = 640.0f;
     }
