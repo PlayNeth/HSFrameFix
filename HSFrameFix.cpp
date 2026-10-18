@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7"
+#define HSFF_VERSION "0.7.1"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1456,7 +1456,7 @@ static volatile bool g_xf = false;
 static float g_xsx = 1, g_xsy = 1, g_xox = 0, g_xoy = 0;
 static int   g_realW = 0, g_realH = 0, g_realBpp = 16;
 static int   g_feCall = 0, g_feTarget = 0;
-static std::atomic<unsigned long> g_wsXfDraws{0}, g_wsVbDraws{0}, g_wsBarClears{0}, g_wsMovieFrames{0};
+static std::atomic<unsigned long> g_wsXfDraws{0}, g_wsBarClears{0}, g_wsMovieFrames{0};
 // race
 static float g_projR = 1.0f;                   // Hor+ factor of the view being set up
 static float g_hudW  = 0.0f;                   // width the HUD lays out in
@@ -1498,176 +1498,92 @@ static int FindMode(int w, int h) {
     return 0;
 }
 
-// ---- Direct3D 7 device hooks (vertices / viewport / clear) ----------------
-struct D3DVP7 { DWORD x, y, w, h; float minz, maxz; };
-struct D3DRC { LONG x1, y1, x2, y2; };
-typedef HRESULT (__stdcall *DevClear_t)(void*, DWORD, D3DRC*, DWORD, DWORD, float, DWORD);
-typedef HRESULT (__stdcall *DevVp_t)(void*, D3DVP7*);
-typedef HRESULT (__stdcall *DevDP_t)(void*, DWORD, DWORD, void*, DWORD, DWORD);
-typedef HRESULT (__stdcall *DevDIP_t)(void*, DWORD, DWORD, void*, DWORD, WORD*, DWORD, DWORD);
-typedef HRESULT (__stdcall *DevDPVB_t)(void*, DWORD, void*, DWORD, DWORD, DWORD);
-typedef HRESULT (__stdcall *DevDIPVB_t)(void*, DWORD, void*, DWORD, DWORD, WORD*, DWORD, DWORD);
-static DevClear_t g_oClear = nullptr;
-static DevVp_t    g_oSetVp = nullptr;
-static DevDP_t    g_oDP = nullptr;
-static DevDIP_t   g_oDIP = nullptr;
-static DevDPVB_t  g_oDPVB = nullptr;
-static DevDIPVB_t g_oDIPVB = nullptr;
-static void* g_dev = nullptr;
-static D3DVP7 g_lastVp = { 0, 0, 640, 480, 0.0f, 1.0f };   // as the game set it
-static BYTE* g_scratch = nullptr; static size_t g_scratchN = 0;
+// ---- thrash draw wrappers (menus): map 640x480 vertices to the screen -------
+// Every thrash driver of this game generation takes 32-byte pre-transformed
+// vertices (x, y at +0/+4) and DWORD indices.
+typedef void (__stdcall *TP1_t)(void*);
+typedef void (__stdcall *TP2_t)(void*, void*);
+typedef void (__stdcall *TP3_t)(void*, void*, void*);
+typedef void (__stdcall *TP4_t)(void*, void*, void*, void*);
+typedef void (__stdcall *TStrip_t)(int, void*);
+typedef void (__stdcall *TMesh_t)(int, void*, DWORD*);
+typedef void (__stdcall *TClip_t)(int, int, int, int);
+static TP1_t g_tPoint; static TP2_t g_tLine; static TP3_t g_tTri; static TP4_t g_tQuad;
+static TStrip_t g_tFan, g_tStrip, g_tLStrip, g_tPStrip;
+static TMesh_t g_tTriM, g_tQuadM, g_tLineM, g_tPointM;
+static TClip_t g_tClip; static TVoid_t g_tClear;
+static int g_clip[4] = { 0, 0, 640, 480 };   // as the game set it
 
 static inline LONG XfX(float x) { return (LONG)lrintf(x * g_xsx + g_xox); }
 static inline LONG XfY(float y) { return (LONG)lrintf(y * g_xsy + g_xoy); }
-static void XfRect(LONG& x1, LONG& y1, LONG& x2, LONG& y2) {
-    LONG a = XfX((float)x1), b = XfY((float)y1), c = XfX((float)x2), d = XfY((float)y2);
-    x1 = a; y1 = b; x2 = c; y2 = d;
+struct XV { float f[8]; };
+static inline void Xv(XV& d, const void* s) {
+    memcpy(&d, s, 32); d.f[0] = d.f[0] * g_xsx + g_xox; d.f[1] = d.f[1] * g_xsy + g_xoy;
 }
-static DWORD FvfSize(DWORD fvf) {
-    DWORD s = 0;
-    switch (fvf & 0x00E) { case 0x002: s = 12; break; case 0x004: s = 16; break;
-                           case 0x006: s = 16; break; case 0x008: s = 20; break;
-                           case 0x00A: s = 24; break; case 0x00C: s = 28; break; case 0x00E: s = 32; break; }
-    if (fvf & 0x010) s += 12;            // normal
-    if (fvf & 0x020) s += 4;             // psize
-    if (fvf & 0x040) s += 4;             // diffuse
-    if (fvf & 0x080) s += 4;             // specular
-    DWORD tc = (fvf >> 8) & 0xF;
-    for (DWORD i = 0; i < tc; i++) {
-        DWORD f = (fvf >> (16 + i * 2)) & 3;   // 0 = 2D, 1 = 3D, 2 = 4D, 3 = 1D
-        s += f == 0 ? 8 : f == 1 ? 12 : f == 2 ? 16 : 4;
-    }
-    return s;
+static XV* g_vbuf = nullptr; static int g_vbufN = 0;
+static XV* VBuf(int n) {
+    if (n > g_vbufN) { free(g_vbuf); g_vbufN = n + 1024; g_vbuf = (XV*)malloc(sizeof(XV) * g_vbufN); if (!g_vbuf) g_vbufN = 0; }
+    return g_vbuf;
 }
-static void* XfVerts(DWORD fvf, const void* v, DWORD n) {
-    DWORD sz = FvfSize(fvf);
-    size_t need = (size_t)sz * n;
-    if (need > g_scratchN) { free(g_scratch); g_scratch = (BYTE*)malloc(need + 4096); g_scratchN = g_scratch ? need + 4096 : 0; }
-    if (!g_scratch) return nullptr;
-    memcpy(g_scratch, v, need);
-    for (DWORD i = 0; i < n; i++) {
-        float* p = (float*)(g_scratch + i * sz);
-        p[0] = p[0] * g_xsx + g_xox; p[1] = p[1] * g_xsy + g_xoy;
-    }
-    return g_scratch;
+static XV* XArr(const void* v, int n) {
+    XV* b = VBuf(n); if (!b) return nullptr;
+    for (int i = 0; i < n; i++) Xv(b[i], (const BYTE*)v + i * 32);
+    g_wsXfDraws++;
+    return b;
 }
-static HRESULT __stdcall HkClear(void* d, DWORD n, D3DRC* r, DWORD fl, DWORD col, float z, DWORD st) {
-    if (g_xf && n && r) {
-        D3DRC tmp[16]; DWORD m = n < 16 ? n : 16;
-        for (DWORD i = 0; i < m; i++) { tmp[i] = r[i]; XfRect(tmp[i].x1, tmp[i].y1, tmp[i].x2, tmp[i].y2); }
-        return g_oClear(d, m, tmp, fl, col, z, st);
-    }
-    return g_oClear(d, n, r, fl, col, z, st);
+static void __stdcall WrPoint(void* a) { if (!g_xf) return g_tPoint(a); XV x; Xv(x, a); g_tPoint(&x); }
+static void __stdcall WrLine(void* a, void* b) { if (!g_xf) return g_tLine(a, b); XV x, y; Xv(x, a); Xv(y, b); g_tLine(&x, &y); }
+static void __stdcall WrTri(void* a, void* b, void* c) {
+    if (!g_xf) return g_tTri(a, b, c);
+    XV x, y, z; Xv(x, a); Xv(y, b); Xv(z, c); g_wsXfDraws++; g_tTri(&x, &y, &z);
 }
-static HRESULT __stdcall HkSetVp(void* d, D3DVP7* vp) {
-    if (vp) g_lastVp = *vp;
-    if (g_xf && vp) {
-        D3DVP7 t = *vp;
-        LONG x1 = vp->x, y1 = vp->y, x2 = vp->x + vp->w, y2 = vp->y + vp->h;
-        XfRect(x1, y1, x2, y2);
-        t.x = x1; t.y = y1; t.w = x2 - x1; t.h = y2 - y1;
-        return g_oSetVp(d, &t);
-    }
-    return g_oSetVp(d, vp);
+static void __stdcall WrQuad(void* a, void* b, void* c, void* d) {
+    if (!g_xf) return g_tQuad(a, b, c, d);
+    XV x, y, z, w; Xv(x, a); Xv(y, b); Xv(z, c); Xv(w, d); g_wsXfDraws++; g_tQuad(&x, &y, &z, &w);
 }
-static inline bool IsTL(DWORD fvf) { return (fvf & 0x00E) == 0x004; }
-static HRESULT __stdcall HkDP(void* d, DWORD pt, DWORD fvf, void* v, DWORD n, DWORD fl) {
-    if (g_xf && IsTL(fvf) && v && n) {
-        void* t = XfVerts(fvf, v, n);
-        if (t) { g_wsXfDraws++; return g_oDP(d, pt, fvf, t, n, fl); }
-    }
-    return g_oDP(d, pt, fvf, v, n, fl);
+static void StripCall(TStrip_t f, int n, void* v, int extra) {
+    if (!g_xf || n <= 0 || !v) return f(n, v);
+    XV* b = XArr(v, n + extra); if (!b) return f(n, v);
+    f(n, b);
 }
-static HRESULT __stdcall HkDIP(void* d, DWORD pt, DWORD fvf, void* v, DWORD n, WORD* idx, DWORD ni, DWORD fl) {
-    if (g_xf && IsTL(fvf) && v && n) {
-        void* t = XfVerts(fvf, v, n);
-        if (t) { g_wsXfDraws++; return g_oDIP(d, pt, fvf, t, n, idx, ni, fl); }
-    }
-    return g_oDIP(d, pt, fvf, v, n, idx, ni, fl);
+static void __stdcall WrFan(int n, void* v)    { StripCall(g_tFan, n, v, 2); }
+static void __stdcall WrStrip(int n, void* v)  { StripCall(g_tStrip, n, v, 2); }
+static void __stdcall WrLStrip(int n, void* v) { StripCall(g_tLStrip, n, v, 1); }
+static void __stdcall WrPStrip(int n, void* v) { StripCall(g_tPStrip, n, v, 0); }
+static void MeshCall(TMesh_t f, int n, void* v, DWORD* idx, int per) {
+    if (!g_xf || n <= 0 || !v || !idx) return f(n, v, idx);
+    DWORD mx = 0;
+    for (int i = 0; i < n * per; i++) if (idx[i] > mx) mx = idx[i];
+    if (mx > 65535) return f(n, v, idx);
+    XV* b = XArr(v, (int)mx + 1); if (!b) return f(n, v, idx);
+    f(n, b, idx);
 }
-static HRESULT __stdcall HkDPVB(void* d, DWORD pt, void* vb, DWORD s, DWORD n, DWORD fl) {
-    if (g_xf) g_wsVbDraws++;
-    return g_oDPVB(d, pt, vb, s, n, fl);
+static void __stdcall WrTriM(int n, void* v, DWORD* i)   { MeshCall(g_tTriM, n, v, i, 3); }
+static void __stdcall WrQuadM(int n, void* v, DWORD* i)  { MeshCall(g_tQuadM, n, v, i, 4); }
+static void __stdcall WrLineM(int n, void* v, DWORD* i)  { MeshCall(g_tLineM, n, v, i, 2); }
+static void __stdcall WrPointM(int n, void* v, DWORD* i) { MeshCall(g_tPointM, n, v, i, 1); }
+static void ClipXf(int x0, int y0, int x1, int y1) {
+    if (g_xf) g_tClip(XfX((float)x0), XfY((float)y0), XfX((float)x1), XfY((float)y1));
+    else g_tClip(x0, y0, x1, y1);
 }
-static HRESULT __stdcall HkDIPVB(void* d, DWORD pt, void* vb, DWORD s, DWORD n, WORD* i, DWORD ni, DWORD fl) {
-    if (g_xf) g_wsVbDraws++;
-    return g_oDIPVB(d, pt, vb, s, n, i, ni, fl);
-}
-static void HookDevice(void* dev) {
-    if (!dev) return;
-    g_dev = dev;
-    void** vt = *(void***)dev;
-    if (vt[10] == (void*)&HkClear) return;           // this vtable is hooked already
-    PatchPointer(&vt[10], (void*)&HkClear, (void**)&g_oClear);
-    PatchPointer(&vt[13], (void*)&HkSetVp, (void**)&g_oSetVp);
-    PatchPointer(&vt[25], (void*)&HkDP, (void**)&g_oDP);
-    PatchPointer(&vt[26], (void*)&HkDIP, (void**)&g_oDIP);
-    PatchPointer(&vt[31], (void*)&HkDPVB, (void**)&g_oDPVB);
-    PatchPointer(&vt[32], (void*)&HkDIPVB, (void**)&g_oDIPVB);
-    Logf("widescreen: Direct3D device hooked\n");
-}
-// IDirect3D7::CreateDevice (vtable 4) and IDirectDraw7::QueryInterface (vtable 0)
-static const GUID kIID_D3D7 = { 0xf5049e77, 0x4861, 0x11d2, { 0xa4, 0x07, 0x00, 0xa0, 0xc9, 0x06, 0x29, 0xa8 } };
-typedef HRESULT (__stdcall *CreateDev_t)(void*, REFCLSID, void*, void**);
-typedef HRESULT (__stdcall *QI_t)(void*, REFIID, void**);
-typedef HRESULT (WINAPI *DDCreateEx_t)(GUID*, void**, REFIID, void*);
-static CreateDev_t g_oCreateDev = nullptr;
-static QI_t g_oDDQI = nullptr;
-static DDCreateEx_t g_oDDCreateEx = nullptr;
-static HRESULT __stdcall HkCreateDev(void* d3d, REFCLSID c, void* surf, void** out) {
-    HRESULT hr = g_oCreateDev(d3d, c, surf, out);
-    if (SUCCEEDED(hr) && out && *out) HookDevice(*out);
-    return hr;
-}
-static HRESULT __stdcall HkDDQI(void* dd, REFIID iid, void** out) {
-    HRESULT hr = g_oDDQI(dd, iid, out);
-    if (SUCCEEDED(hr) && out && *out && IsEqualGUID(iid, kIID_D3D7)) {
-        void** vt = *(void***)*out;
-        if (vt[4] != (void*)&HkCreateDev) PatchPointer(&vt[4], (void*)&HkCreateDev, (void**)&g_oCreateDev);
-    }
-    return hr;
-}
-static HRESULT WINAPI HkDDCreateEx(GUID* g, void** out, REFIID iid, void* u) {
-    HRESULT hr = g_oDDCreateEx(g, out, iid, u);
-    if (SUCCEEDED(hr) && out && *out) {
-        void** vt = *(void***)*out;
-        if (vt[0] != (void*)&HkDDQI) PatchPointer(&vt[0], (void*)&HkDDQI, (void**)&g_oDDQI);
-    }
-    return hr;
-}
-static void HookModuleDDraw(HMODULE m) {
-    BYTE* base = (BYTE*)m;
-    auto nt = (PIMAGE_NT_HEADERS)(base + ((PIMAGE_DOS_HEADER)base)->e_lfanew);
-    DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    if (!rva) return;
-    for (auto imp = (PIMAGE_IMPORT_DESCRIPTOR)(base + rva); imp->Name; ++imp) {
-        if (_stricmp((const char*)(base + imp->Name), "ddraw.dll")) continue;
-        auto th = (PIMAGE_THUNK_DATA)(base + imp->FirstThunk);
-        auto on = (PIMAGE_THUNK_DATA)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
-        for (; th->u1.Function; ++th, ++on) {
-            if (IMAGE_SNAP_BY_ORDINAL(on->u1.Ordinal)) continue;
-            auto nm = (PIMAGE_IMPORT_BY_NAME)(base + on->u1.AddressOfData);
-            if (!strcmp((const char*)nm->Name, "DirectDrawCreateEx") &&
-                th->u1.Function != (DWORD)&HkDDCreateEx)
-                PatchPointer((void**)&th->u1.Function, (void*)&HkDDCreateEx, (void**)&g_oDDCreateEx);
-        }
-    }
+static void __stdcall WrClip(int x0, int y0, int x1, int y1) {
+    g_clip[0] = x0; g_clip[1] = y0; g_clip[2] = x1; g_clip[3] = y1;
+    ClipXf(x0, y0, x1, y1);
 }
 
 // ---- thrash wrappers --------------------------------------------------------
+// black bars: the clear only covers the clip rectangle, so clear each bar
 static void ClearBars() {
-    if (!g_dev || !g_oClear || !g_oSetVp || g_realW <= 0) return;
-    LONG x0 = XfX(0), y0 = XfY(0), x1 = XfX(640), y1 = XfY(480);
-    D3DRC r[4]; DWORD n = 0;
-    if (x0 > 0) r[n++] = { 0, 0, x0, g_realH };
-    if (x1 < g_realW) r[n++] = { x1, 0, g_realW, g_realH };
-    if (y0 > 0) r[n++] = { x0, 0, x1, y0 };
-    if (y1 < g_realH) r[n++] = { x0, y1, x1, g_realH };
+    if (!g_tClip || !g_tClear || g_realW <= 0) return;
+    int x0 = XfX(0), y0 = XfY(0), x1 = XfX(640), y1 = XfY(480);
+    int r[4][4]; int n = 0;
+    if (x0 > 0) { int t[4] = { 0, 0, x0, g_realH }; memcpy(r[n++], t, sizeof t); }
+    if (x1 < g_realW) { int t[4] = { x1, 0, g_realW, g_realH }; memcpy(r[n++], t, sizeof t); }
+    if (y0 > 0) { int t[4] = { x0, 0, x1, y0 }; memcpy(r[n++], t, sizeof t); }
+    if (y1 < g_realH) { int t[4] = { x0, y1, x1, g_realH }; memcpy(r[n++], t, sizeof t); }
     if (!n) return;
-    D3DVP7 full = { 0, 0, (DWORD)g_realW, (DWORD)g_realH, 0.0f, 1.0f };
-    g_oSetVp(g_dev, &full);
-    g_oClear(g_dev, n, r, 1 /* D3DCLEAR_TARGET */, 0xFF000000, 1.0f, 0);
-    HkSetVp(g_dev, &g_lastVp);              // back to the game's viewport (mapped)
+    for (int i = 0; i < n; i++) { g_tClip(r[i][0], r[i][1], r[i][2], r[i][3]); g_tClear(); }
+    ClipXf(g_clip[0], g_clip[1], g_clip[2], g_clip[3]);
     g_wsBarClears++;
 }
 static void __stdcall WrFlip() {
@@ -1741,8 +1657,25 @@ static FARPROC WINAPI HkGetProcAddress(HMODULE m, LPCSTR name) {
         g_thrashMod = m;
         char fn[MAX_PATH] = {}; GetModuleFileNameA(m, fn, MAX_PATH);
         Logf("widescreen: renderer driver %s\n", fn);
-        HookModuleDDraw(m);
     }
+    struct W { const char* n; void** real; void* wr; };
+    static const W kW[] = {
+        { "_THRASH_drawpoint@4", (void**)&g_tPoint, (void*)&WrPoint },
+        { "_THRASH_drawline@8", (void**)&g_tLine, (void*)&WrLine },
+        { "_THRASH_drawtri@12", (void**)&g_tTri, (void*)&WrTri },
+        { "_THRASH_drawquad@16", (void**)&g_tQuad, (void*)&WrQuad },
+        { "_THRASH_drawtrifan@8", (void**)&g_tFan, (void*)&WrFan },
+        { "_THRASH_drawtristrip@8", (void**)&g_tStrip, (void*)&WrStrip },
+        { "_THRASH_drawlinestrip@8", (void**)&g_tLStrip, (void*)&WrLStrip },
+        { "_THRASH_drawpointstrip@8", (void**)&g_tPStrip, (void*)&WrPStrip },
+        { "_THRASH_drawtrimesh@12", (void**)&g_tTriM, (void*)&WrTriM },
+        { "_THRASH_drawquadmesh@12", (void**)&g_tQuadM, (void*)&WrQuadM },
+        { "_THRASH_drawlinemesh@12", (void**)&g_tLineM, (void*)&WrLineM },
+        { "_THRASH_drawpointmesh@12", (void**)&g_tPointM, (void*)&WrPointM },
+        { "_THRASH_clip@16", (void**)&g_tClip, (void*)&WrClip },
+    };
+    for (const W& w : kW) if (!strcmp(name, w.n)) { *w.real = (void*)p; return (FARPROC)w.wr; }
+    if (!strcmp(name, "_THRASH_clearwindow@0")) g_tClear = (TVoid_t)p;
     if (!strcmp(name, "_THRASH_setvideomode@12")) { g_tSetMode = (TSetMode_t)p; return (FARPROC)&WrSetMode; }
     if (!strcmp(name, "_THRASH_pageflip@0"))      { g_tFlip = (TVoid_t)p;      return (FARPROC)&WrFlip; }
     if (!strcmp(name, "_THRASH_lockwindow@0"))    { g_tLock = (TLock_t)p;      return (FARPROC)&WrLock; }
@@ -1761,7 +1694,8 @@ extern "C" void __cdecl WsBeforeFeMode() {
     if (g_cfg.wsMenuResolution != 2) {
         WsCallSelMode();
         t = (int)g_wsSelResult;
-        if (!ModeEntry(t, &w, &h, nullptr) || w < 640 || h < 480) t = 0;
+        // at startup the saved race mode isn't loaded yet (640x480 comes back)
+        if (!ModeEntry(t, &w, &h, nullptr) || w < 640 || h < 480 || (w == 640 && h == 480)) t = 0;
     }
     if (!t && g_dispW) t = FindMode(g_dispW, g_dispH);
     g_feTarget = t;
@@ -1973,6 +1907,14 @@ static DWORD WINAPI StatsThread(LPVOID) {
         LoadStatsTick();
         unsigned long mf = g_menuFrames;
         if (mf != lmf) Logf("last %ds: menu frames %.1f/s\n", sec, (mf - lmf) / (double)sec);
+        {
+            static unsigned long lx = 0, lbc = 0, lmv = 0;
+            unsigned long x = g_wsXfDraws, bc = g_wsBarClears, mv = g_wsMovieFrames;
+            if (g_cfg.wsLog && (x != lx || mv != lmv))
+                Logf("  widescreen: menu draws mapped %lu, bar clears %lu, movie frames scaled %lu\n",
+                     x - lx, bc - lbc, mv - lmv);
+            lx = x; lbc = bc; lmv = mv;
+        }
         lmf = mf;
         unsigned long s = g_steps, r = g_renders, e = g_extraRenders, f = g_tickFires,
                       b = g_blended, rj = g_rejected;
