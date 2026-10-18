@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.7"
+#define HSFF_VERSION "0.7.8"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1796,6 +1796,8 @@ extern "C" void __cdecl WsPostRects() {
         float x0 = (float)lrintf(w43 * f[1]) + off, x1 = (float)lrintf(w43 * f[3]) + off;
         if (x0 < 0) x0 = 0;
         if (x1 > W - 1) x1 = (float)(W - 1);
+        if (g_cfg.wsLog) Logf("  HUD box %2d/%d: x %.3f-%.3f y %.3f-%.3f -> %s, px %.0f-%.0f\n", i, j,
+                              f[1], f[3], f[0], f[2], a == 0 ? "left" : a == 2 ? "right" : "middle", x0, x1);
         p[1] = x0; p[3] = x1;
         moved[a]++;
     }
