@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.5"
+#define HSFF_VERSION "0.7.6"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1608,6 +1608,7 @@ static void* __stdcall WrLock() {
 // FMVs are copied in software into the top-left 640x480 of the locked frame;
 // scale that block in place to the menu area (from the bottom-right, so no
 // source pixel is overwritten before it is read) and blank the rest of it.
+static const int kMovieW = 636;   // the last 4 columns of the movie picture are never written
 static void ScaleLockedFrame() {
     BYTE* bits = *(BYTE**)g_lockInfo; int pitch = *(int*)((BYTE*)g_lockInfo + 4);
     if (!bits || pitch <= 0) return;
@@ -1628,10 +1629,10 @@ static void ScaleLockedFrame() {
         BYTE* drow = bits + (size_t)y * pitch; const BYTE* srow = src + (size_t)sy * 640 * bp;
         if (bp == 4) {
             DWORD* dr = (DWORD*)drow; const DWORD* sr = (const DWORD*)srow;
-            for (int x = X0; x < X1; x++) { int sx = (int)((x - g_xox) / g_xsx); dr[x] = sr[sx < 0 ? 0 : sx > 639 ? 639 : sx]; }
+            for (int x = X0; x < X1; x++) { int sx = (int)((x - g_xox) / g_xsx); dr[x] = sx >= kMovieW ? 0 : sr[sx < 0 ? 0 : sx]; }
         } else {
             WORD* dr = (WORD*)drow; const WORD* sr = (const WORD*)srow;
-            for (int x = X0; x < X1; x++) { int sx = (int)((x - g_xox) / g_xsx); dr[x] = sr[sx < 0 ? 0 : sx > 639 ? 639 : sx]; }
+            for (int x = X0; x < X1; x++) { int sx = (int)((x - g_xox) / g_xsx); dr[x] = sx >= kMovieW ? 0 : sr[sx < 0 ? 0 : sx]; }
         }
     }
     g_wsMovieFrames++;
