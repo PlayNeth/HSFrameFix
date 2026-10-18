@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.2"
+#define HSFF_VERSION "0.7.3"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -225,6 +225,8 @@ struct Config {
     int   wsMovies         = 1;     // scale FMVs with the menus
     int   wsUnlockResolutions = 1;  // list non-4:3 display modes
     int   wsLog            = 1;
+    int   wsRaceWidth      = 0;     // remembered race resolution (the game only saves the width)
+    int   wsRaceHeight     = 0;
 };
 static Config g_cfg;
 static char g_asiDir[MAX_PATH] = {};
@@ -375,6 +377,8 @@ static void LoadConfig() {
         else if (!_stricmp(key, "wsMovies"))          g_cfg.wsMovies = atoi(val);
         else if (!_stricmp(key, "wsUnlockResolutions")) g_cfg.wsUnlockResolutions = atoi(val);
         else if (!_stricmp(key, "wsLog"))             g_cfg.wsLog = atoi(val);
+        else if (!_stricmp(key, "wsRaceWidth"))       g_cfg.wsRaceWidth = atoi(val);
+        else if (!_stricmp(key, "wsRaceHeight"))      g_cfg.wsRaceHeight = atoi(val);
     }
     fclose(f);
     if (!sawNew) {                        // ini from an older version: add the new keys
@@ -1433,6 +1437,10 @@ namespace ws {
     const DWORD hudX224[2]      = { 0x4D0A30, 0x4D0B66 }; // float immediates (224.0)
     const DWORD callRects       = 0x4CE7D6, fnRects = 0x4D0550;
     const DWORD pRects          = 0x7CB0BC;
+    const DWORD pCurMode        = 0x5BEF94;             // mode the game last set
+    const DWORD modeLookupJe    = 0x51A677;             // je (4:3 only) in the width -> mode lookup
+    const DWORD callLookupSaved = 0x4C2BB5;             // lookup of the saved resolution
+    const DWORD fnLookup        = 0x51A530;
 
     struct Restore { DWORD addr; const char* orig; int len; };
     const Restore kOtherPatch[] = {        // original bytes at the other widescreen patch's sites
@@ -1455,7 +1463,7 @@ static int   g_dispW = 0, g_dispH = 0;          // desktop at startup
 static volatile bool g_xf = false;
 static float g_xsx = 1, g_xsy = 1, g_xox = 0, g_xoy = 0;
 static int   g_realW = 0, g_realH = 0, g_realBpp = 16;
-static int   g_feCall = 0, g_feTarget = 0;
+static int   g_feCall = 0, g_feTarget = 0, g_curRealIdx = 0;
 static std::atomic<unsigned long> g_wsXfDraws{0}, g_wsBarClears{0}, g_wsMovieFrames{0};
 // race
 static float g_projR = 1.0f;                   // Hor+ factor of the view being set up
@@ -1648,6 +1656,7 @@ static int __stdcall WrSetMode(int idx, int a2, int bppCode) {
     }
     if (g_feCall && g_feTarget > 0) use = g_feTarget;
     int r = g_tSetMode(use, a2, bppCode);
+    g_curRealIdx = use;
     int w = 0, h = 0, bpp = 16;
     if (ModeEntry(use, &w, &h, &bpp)) {
         int req = bppCode == 2 ? 32 : 16;
@@ -1707,6 +1716,8 @@ extern "C" void __cdecl WsBeforeFeMode() {
     }
     if (!t && g_dispW) t = FindMode(g_dispW, g_dispH);
     g_feTarget = t;
+    // the game skips the switch when it thinks mode 1 is already set
+    if (t > 0 && t != g_curRealIdx) *(int*)ws::pCurMode = -1;
     if (g_cfg.wsLog) Logf("widescreen: menu mode wanted: %d (race mode setting %lu)\n", t, (unsigned long)g_wsSelResult);
 }
 extern "C" void __cdecl WsAfterFeMode() {
@@ -1739,6 +1750,10 @@ static void ApplyHud(int W, int H) {
 }
 extern "C" void __cdecl WsAfterRaceMode() {
     int W = Rd<int>(ws::pModeW), H = Rd<int>(ws::pModeH);
+    if (W > 0 && H > 0 && (W != g_cfg.wsRaceWidth || H != g_cfg.wsRaceHeight)) {
+        g_cfg.wsRaceWidth = W; g_cfg.wsRaceHeight = H;
+        ReplaceIniLine("wsRaceWidth", W); ReplaceIniLine("wsRaceHeight", H);
+    }
     ApplyHud(W, H);
     if (g_cfg.wsLog) Logf("widescreen: race at %dx%d - HUD lays out %.0f wide, Hor+ %s\n",
                           W, H, g_hudW, g_cfg.wsFixFOV ? "on" : "off");
@@ -1796,6 +1811,19 @@ extern "C" void __stdcall WsProj(float x, float y, float w, float h, float a, fl
     }
 }
 
+// The game saves only the width of the race resolution and, at startup, picks
+// the 4:3 mode closest to it (1366 -> 1024x768). Use the remembered size.
+extern "C" { DWORD g_wsFnLookup = 0x51A530; }
+extern "C" int __cdecl WsFindMode(int w, int bpp) {
+    (void)bpp;
+    if (w > 0 && w == g_cfg.wsRaceWidth && g_cfg.wsRaceHeight > 0) {
+        int i = FindMode(w, g_cfg.wsRaceHeight);
+        if (g_cfg.wsLog) Logf("widescreen: saved resolution %dx%d -> mode %d\n", w, g_cfg.wsRaceHeight, i);
+        return i;
+    }
+    return 0;
+}
+extern "C" void WsFindModeStub();
 extern "C" void WsFeModeStub();
 extern "C" void WsRaceModeStub();
 extern "C" void WsFrustumStub();
@@ -1810,6 +1838,22 @@ asm(".text\n"
     "    popal\n"
     "    ret\n"
     // call sites of SetVideoMode(eax = mode) for the menus / the race
+    // call of the width -> mode lookup for the saved resolution (eax = w, edx = bpp)
+    ".globl _WsFindModeStub\n"
+    "_WsFindModeStub:\n"
+    "    pushl %ecx\n"
+    "    pushl %edx\n"
+    "    pushl %eax\n"
+    "    call _WsFindMode\n"
+    "    testl %eax, %eax\n"
+    "    jz 1f\n"
+    "    addl $8, %esp\n"
+    "    popl %ecx\n"
+    "    ret\n"
+    "1:  popl %eax\n"
+    "    popl %edx\n"
+    "    popl %ecx\n"
+    "    jmp *_g_wsFnLookup\n"
     ".globl _WsFeModeStub\n"
     "_WsFeModeStub:\n"
     "    pushal\n"
@@ -1879,7 +1923,12 @@ static void InstallWidescreen() {
         if (!strcmp(nm, "GetProcAddress")) ok &= PatchPointer(slot, (void*)&HkGetProcAddress, (void**)&g_oGPA);
     });
     if (!g_oGPA) { Logf("widescreen: GetProcAddress import not found - off\n"); return; }
-    if (g_cfg.wsUnlockResolutions) { BYTE b = 0x00; ok &= PatchBytes(ws::modeFilterRel, &b, 1); }  // -> accept
+    if (g_cfg.wsUnlockResolutions) {
+        BYTE b = 0x00; ok &= PatchBytes(ws::modeFilterRel, &b, 1);   // options list: accept any shape
+        BYTE j[2] = { 0x90, 0xE9 };                                  // width lookup: any shape (je -> jmp)
+        if (*(BYTE*)ws::modeLookupJe == 0x0F) ok &= PatchBytes(ws::modeLookupJe, j, 2);
+        ok &= PatchRel32(ws::callLookupSaved, 0xE8, (void*)&WsFindModeStub);
+    }
     else if (*(BYTE*)ws::modeFilterRel == 0x00) { BYTE b = 0x2E; ok &= PatchBytes(ws::modeFilterRel, &b, 1); }
     for (DWORD at : ws::callModeFE) ok &= PatchRel32(at, 0xE8, (void*)&WsFeModeStub);
     ok &= PatchRel32(ws::callModeRace, 0xE8, (void*)&WsRaceModeStub);
