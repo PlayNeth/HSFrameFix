@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.4"
+#define HSFF_VERSION "0.7.5"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1612,26 +1612,27 @@ static void ScaleLockedFrame() {
     BYTE* bits = *(BYTE**)g_lockInfo; int pitch = *(int*)((BYTE*)g_lockInfo + 4);
     if (!bits || pitch <= 0) return;
     int bp = g_realBpp >= 24 ? 4 : 2;
+    if (pitch < g_realW * bp) return;
+    // the movie player writes a packed 640x480 picture (rows 640 pixels apart),
+    // not rows at the surface pitch
+    static BYTE* src = nullptr;
+    size_t srcN = (size_t)640 * 480 * bp;
+    if (!src) src = (BYTE*)malloc((size_t)640 * 480 * 4);
+    if (!src || (size_t)pitch * g_realH < srcN) return;
+    memcpy(src, bits, srcN);
+    for (int y = 0; y < g_realH; y++) memset(bits + (size_t)y * pitch, 0, (size_t)g_realW * bp);
     int X0 = XfX(0), Y0 = XfY(0), X1 = XfX(640), Y1 = XfY(480);
     if (X0 < 0) X0 = 0; if (Y0 < 0) Y0 = 0; if (X1 > g_realW) X1 = g_realW; if (Y1 > g_realH) Y1 = g_realH;
-    if (pitch < X1 * bp) return;
-    for (int y = Y1 - 1; y >= Y0; y--) {
+    for (int y = Y0; y < Y1; y++) {
         int sy = (int)((y - g_xoy) / g_xsy); if (sy < 0) sy = 0; if (sy > 479) sy = 479;
-        BYTE* drow = bits + (size_t)y * pitch; const BYTE* srow = bits + (size_t)sy * pitch;
+        BYTE* drow = bits + (size_t)y * pitch; const BYTE* srow = src + (size_t)sy * 640 * bp;
         if (bp == 4) {
             DWORD* dr = (DWORD*)drow; const DWORD* sr = (const DWORD*)srow;
-            for (int x = X1 - 1; x >= X0; x--) { int sx = (int)((x - g_xox) / g_xsx); dr[x] = sr[sx < 0 ? 0 : sx > 639 ? 639 : sx]; }
+            for (int x = X0; x < X1; x++) { int sx = (int)((x - g_xox) / g_xsx); dr[x] = sr[sx < 0 ? 0 : sx > 639 ? 639 : sx]; }
         } else {
             WORD* dr = (WORD*)drow; const WORD* sr = (const WORD*)srow;
-            for (int x = X1 - 1; x >= X0; x--) { int sx = (int)((x - g_xox) / g_xsx); dr[x] = sr[sx < 0 ? 0 : sx > 639 ? 639 : sx]; }
+            for (int x = X0; x < X1; x++) { int sx = (int)((x - g_xox) / g_xsx); dr[x] = sr[sx < 0 ? 0 : sx > 639 ? 639 : sx]; }
         }
-    }
-    int hh = 480 < g_realH ? 480 : g_realH, ww = 640 < g_realW ? 640 : g_realW;
-    for (int y = 0; y < hh; y++) {
-        BYTE* row = bits + (size_t)y * pitch;
-        if (y < Y0 || y >= Y1) { memset(row, 0, (size_t)ww * bp); continue; }
-        if (X0 > 0) memset(row, 0, (size_t)(X0 < ww ? X0 : ww) * bp);
-        if (X1 < ww) memset(row + (size_t)X1 * bp, 0, (size_t)(ww - X1) * bp);
     }
     g_wsMovieFrames++;
 }
