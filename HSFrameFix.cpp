@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.10"
+#define HSFF_VERSION "0.7.11"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1853,12 +1853,8 @@ extern "C" void WsFrustumStub();
 extern "C" void WsZoomStub();
 extern "C" void WsRectsStub();
 extern "C" void WsFontWStub();
-// HUD text sizes scale with the screen width: use the 4:3 width so text fits its boxes
-extern "C" int __cdecl WsFontW() {
-    int W = Rd<int>(ws::pScrW), H = Rd<int>(ws::pScrH);
-    if (g_cfg.wsHud && W > 0 && H > 0 && W * 3 > H * 4 + 2) return (int)lrintf(H * 4.0f / 3.0f);
-    return W;
-}
+// (HUD text sizes need nothing extra: their 1/640 constant at 0x59967F is one of hudInv640)
+extern "C" int __cdecl WsFontW() { return (int)lrintf(g_hudW); }
 asm(".text\n"
     ".globl _WsCallSelMode\n"
     "_WsCallSelMode:\n"
@@ -1985,7 +1981,6 @@ static void InstallWidescreen() {
         ok &= PatchBytes(ws::hudWidthLoad, f, 6);
         for (DWORD at : ws::hudFitW) if (*(WORD*)at == 0x05DB) ok &= PatchBytes(at, f, 6);
         ok &= PatchRel32(ws::callRects, 0xE8, (void*)&WsRectsStub);
-        if (*(BYTE*)ws::hudFontWLoad == 0xA1) ok &= PatchRel32(ws::hudFontWLoad, 0xE8, (void*)&WsFontWStub);
         g_hudPatched = true;
         g_hudW = 640.0f;
     }
