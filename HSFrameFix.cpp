@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.12"
+#define HSFF_VERSION "0.7.13"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1947,37 +1947,38 @@ asm(".text\n"
 // ---------------------------------------------------------------------------
 // Closing the window from outside (Alt+F4, the window manager): the game's window
 // thread posts WM_QUIT from WM_DESTROY (0x54E37B) and ends, but the game thread
-// never finds out and keeps running (or hangs) without a window. If the game's
-// main window is still gone a few seconds after that, end the process. A normal
-// quit has exited long before then.
+// never finds out and keeps running, hangs, or crashes while shutting down without
+// a window. The game destroys its own window only through DestroyWindow at
+// 0x54EBBC (after its own quit), so a WM_DESTROY outside that call means the
+// window was closed from outside: end the process right there.
 // ---------------------------------------------------------------------------
 typedef void (WINAPI *PostQuitMessage_t)(int);
+typedef BOOL (WINAPI *DestroyWindow_t)(HWND);
 static PostQuitMessage_t g_oPostQuit = nullptr;
-static volatile LONG g_closeWatch = 0;
-static DWORD WINAPI CloseWatchThread(LPVOID) {
-    Sleep(3000);
-    HWND hw = *(HWND*)0x9EDAA8;                       // the game's main window
-    if (!hw || !IsWindow(hw)) {
-        Logf("window closed but the game is still running - ending it\n");
-        TerminateProcess(GetCurrentProcess(), 0);
-    }
-    InterlockedExchange(&g_closeWatch, 0);
-    return 0;
+static DestroyWindow_t g_oDestroyWindow = nullptr;
+static volatile LONG g_ownDestroy = 0;
+static BOOL WINAPI HkDestroyWindow(HWND h) {
+    InterlockedIncrement(&g_ownDestroy);
+    BOOL r = g_oDestroyWindow(h);
+    InterlockedDecrement(&g_ownDestroy);
+    return r;
 }
 static void WINAPI HkPostQuitMessage(int code) {
-    g_oPostQuit(code);
-    if (InterlockedCompareExchange(&g_closeWatch, 1, 0) == 0) {
-        HANDLE t = CreateThread(nullptr, 0, CloseWatchThread, nullptr, 0, nullptr);
-        if (t) CloseHandle(t); else InterlockedExchange(&g_closeWatch, 0);
+    if (!g_ownDestroy && g_oDestroyWindow) {
+        Logf("window closed from outside the game - exiting\n");
+        TerminateProcess(GetCurrentProcess(), 0);
     }
+    g_oPostQuit(code);
 }
 static void InstallCloseFix() {
     if (!g_knownExe || !g_cfg.closeExits) return;
-    bool ok = false;
+    bool q = false, d = false;
     ForEachImport("USER32.dll", [&](void** slot, const char* nm) {
-        if (!strcmp(nm, "PostQuitMessage")) ok = PatchPointer(slot, (void*)&HkPostQuitMessage, (void**)&g_oPostQuit);
+        if (!strcmp(nm, "PostQuitMessage")) q = PatchPointer(slot, (void*)&HkPostQuitMessage, (void**)&g_oPostQuit);
+        else if (!strcmp(nm, "DestroyWindow")) d = PatchPointer(slot, (void*)&HkDestroyWindow, (void**)&g_oDestroyWindow);
     });
-    Logf("close fix: %s\n", ok ? "on" : "PostQuitMessage import not found");
+    if (!d) g_oDestroyWindow = nullptr;
+    Logf("close fix: %s\n", q && d ? "on" : "imports not found - off");
 }
 
 static void InstallWidescreen() {
