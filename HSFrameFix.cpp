@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.11"
+#define HSFF_VERSION "0.7.12"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -225,6 +225,7 @@ struct Config {
     int   wsMovies         = 1;     // scale FMVs with the menus
     int   wsUnlockResolutions = 1;  // list non-4:3 display modes
     int   wsLog            = 1;
+    int   closeExits       = 1;     // closing the window (Alt+F4, window manager) ends the game
     int   wsRaceWidth      = 0;     // remembered race resolution (the game only saves the width)
     int   wsRaceHeight     = 0;
 };
@@ -377,6 +378,7 @@ static void LoadConfig() {
         else if (!_stricmp(key, "wsMovies"))          g_cfg.wsMovies = atoi(val);
         else if (!_stricmp(key, "wsUnlockResolutions")) g_cfg.wsUnlockResolutions = atoi(val);
         else if (!_stricmp(key, "wsLog"))             g_cfg.wsLog = atoi(val);
+        else if (!_stricmp(key, "closeExits"))        g_cfg.closeExits = atoi(val);
         else if (!_stricmp(key, "wsRaceWidth"))       g_cfg.wsRaceWidth = atoi(val);
         else if (!_stricmp(key, "wsRaceHeight"))      g_cfg.wsRaceHeight = atoi(val);
     }
@@ -1799,7 +1801,7 @@ extern "C" void __cdecl WsPostRects() {
         float x0 = (float)lrintf(w43 * f[1]) + off, x1 = (float)lrintf(w43 * f[3]) + off;
         if (x0 < 0) x0 = 0;
         if (x1 > W - 1) x1 = (float)(W - 1);
-        if (g_cfg.wsLog) Logf("  HUD box %2d/%d: x %.3f-%.3f y %.3f-%.3f -> %s, px %.0f-%.0f\n", i, j,
+        if (g_cfg.wsLog >= 2) Logf("  HUD box %2d/%d: x %.3f-%.3f y %.3f-%.3f -> %s, px %.0f-%.0f\n", i, j,
                               f[1], f[3], f[0], f[2], a == 0 ? "left" : a == 2 ? "right" : "middle", x0, x1);
         p[1] = x0; p[3] = x1;
         moved[a]++;
@@ -1942,6 +1944,42 @@ asm(".text\n"
     "    popl %ecx\n"
     "    ret\n");
 
+// ---------------------------------------------------------------------------
+// Closing the window from outside (Alt+F4, the window manager): the game's window
+// thread posts WM_QUIT from WM_DESTROY (0x54E37B) and ends, but the game thread
+// never finds out and keeps running (or hangs) without a window. If the game's
+// main window is still gone a few seconds after that, end the process. A normal
+// quit has exited long before then.
+// ---------------------------------------------------------------------------
+typedef void (WINAPI *PostQuitMessage_t)(int);
+static PostQuitMessage_t g_oPostQuit = nullptr;
+static volatile LONG g_closeWatch = 0;
+static DWORD WINAPI CloseWatchThread(LPVOID) {
+    Sleep(3000);
+    HWND hw = *(HWND*)0x9EDAA8;                       // the game's main window
+    if (!hw || !IsWindow(hw)) {
+        Logf("window closed but the game is still running - ending it\n");
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
+    InterlockedExchange(&g_closeWatch, 0);
+    return 0;
+}
+static void WINAPI HkPostQuitMessage(int code) {
+    g_oPostQuit(code);
+    if (InterlockedCompareExchange(&g_closeWatch, 1, 0) == 0) {
+        HANDLE t = CreateThread(nullptr, 0, CloseWatchThread, nullptr, 0, nullptr);
+        if (t) CloseHandle(t); else InterlockedExchange(&g_closeWatch, 0);
+    }
+}
+static void InstallCloseFix() {
+    if (!g_knownExe || !g_cfg.closeExits) return;
+    bool ok = false;
+    ForEachImport("USER32.dll", [&](void** slot, const char* nm) {
+        if (!strcmp(nm, "PostQuitMessage")) ok = PatchPointer(slot, (void*)&HkPostQuitMessage, (void**)&g_oPostQuit);
+    });
+    Logf("close fix: %s\n", ok ? "on" : "PostQuitMessage import not found");
+}
+
 static void InstallWidescreen() {
     g_dispW = GetSystemMetrics(SM_CXSCREEN); g_dispH = GetSystemMetrics(SM_CYSCREEN);
     if (!g_knownExe || !g_cfg.widescreen) { Logf("widescreen: off\n"); return; }
@@ -2047,6 +2085,7 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
         InstallLoadingAndFov();
         InstallGlideMenuEffects();
         InstallWidescreen();
+        InstallCloseFix();
         if (g_qEvent) CreateThread(nullptr, 0, WriterThread, nullptr, 0, nullptr);
         if (g_log) CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
