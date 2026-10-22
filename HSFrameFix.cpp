@@ -88,7 +88,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.13"
+#define HSFF_VERSION "0.7.14"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -657,7 +657,10 @@ static void InstallTickScheduler() {
         }
     });
     g_ticksActive = s && k && g_tickWake;
-    if (g_ticksActive) g_tickThread = CreateThread(nullptr, 0, TickThread, nullptr, 0, nullptr);
+    if (g_ticksActive) {
+        g_tickThread = CreateThread(nullptr, 0, TickThread, nullptr, 0, nullptr);
+        if (!g_tickThread) g_ticksActive = false;        // no thread: every call goes to the game's timer
+    }
     Logf("precise ticks: %s\n", g_ticksActive && g_tickThread ? "on" : "FAILED (game timer used)");
 }
 
@@ -908,8 +911,17 @@ static int MenuCeiling() {
         int hz = 0;
         if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm)) hz = (int)dm.dmDisplayFrequency;
         if (hz < 30 || hz > 1000) hz = 60;                 // "default"/unknown
-        int c = hz;
-        for (int n = 1; c > 128; n++) c = hz / (n + 1);
+        // highest rate <= 128 that divides the refresh rate (even pacing), not
+        // below 50; otherwise the first rate <= 128 (e.g. 165 Hz -> 55, 144 -> 72)
+        int c = 0, first = 0;
+        for (int n = 1; n <= 64; n++) {
+            int r = hz / n;
+            if (r > 128) continue;
+            if (!first) first = r;
+            if (r < 50) break;
+            if (hz % n == 0) { c = r; break; }
+        }
+        if (!c) c = first ? first : 60;
         if (c != cached) { cached = c; LogfAsync("menus: frame ceiling %d fps (display %d Hz)\n", c, hz); }
     }
     return cached;
@@ -1197,15 +1209,6 @@ static int* FovSlot(int type) {
     }
     return nullptr;
 }
-static const char* FovKey(int type) {
-    switch (type) {
-        case 1: return "fovOffsetInCar";
-        case 2: return "fovOffsetBumper";
-        case 3: case 5: return "fovOffsetHeli";
-        case 4: case 6: return "fovOffsetRoof";
-    }
-    return "fovOffset";
-}
 static const char* FovName(int type) {
     switch (type) {
         case 1: return "in-car"; case 2: return "bumper"; case 3: return "heli";
@@ -1273,12 +1276,22 @@ extern "C" int __cdecl DashFov() {
     return f;
 }
 
+// Called from the game thread (race resolution) and the writer thread (FOV
+// hotkeys): serialized, and the file is left alone if it doesn't fit the buffer.
+static CRITICAL_SECTION g_iniLock;
+static bool g_iniLockInit = false;
+static void ReplaceIniLineLocked(const char* key, int value);
 static void ReplaceIniLine(const char* key, int value) {
-    if (!g_iniPath[0]) return;
+    if (!g_iniPath[0] || !g_iniLockInit) return;
+    EnterCriticalSection(&g_iniLock);
+    ReplaceIniLineLocked(key, value);
+    LeaveCriticalSection(&g_iniLock);
+}
+static void ReplaceIniLineLocked(const char* key, int value) {
     FILE* f = fopen(g_iniPath, "r");
     if (!f) return;
     static char buf[32768];
-    size_t n = 0; char line[256]; bool done = false; size_t kl = strlen(key);
+    size_t n = 0; char line[256]; bool done = false, full = false; size_t kl = strlen(key);
     while (fgets(line, sizeof(line), f)) {
         char out[256];
         const char* p = line; while (*p == ' ' || *p == '\t') p++;
@@ -1286,11 +1299,12 @@ static void ReplaceIniLine(const char* key, int value) {
             snprintf(out, sizeof(out), "%s=%d\n", key, value); done = true;
         } else snprintf(out, sizeof(out), "%s", line);
         size_t l = strlen(out);
-        if (n + l < sizeof(buf)) { memcpy(buf + n, out, l); n += l; }
+        if (n + l < sizeof(buf)) { memcpy(buf + n, out, l); n += l; } else full = true;
     }
     fclose(f);
     if (!done) { char out[128]; snprintf(out, sizeof(out), "%s=%d\n", key, value);
-                 size_t l = strlen(out); if (n + l < sizeof(buf)) { memcpy(buf + n, out, l); n += l; } }
+                 size_t l = strlen(out); if (n + l < sizeof(buf)) { memcpy(buf + n, out, l); n += l; } else full = true; }
+    if (full) { Logf("ini: too big to update %s (left unchanged)\n", key); return; }
     f = fopen(g_iniPath, "w");
     if (f) { fwrite(buf, 1, n, f); fclose(f); }
 }
@@ -1435,7 +1449,6 @@ namespace ws {
     const DWORD pFocalX = 0x5B0950, pFocalY = 0x5B0954;
     const DWORD hudWidthLoad    = 0x4CE753;             // fild [0x853A98] (6 bytes)
     const DWORD hudFitW[2]      = { 0x4D2737, 0x4D28F6 };  // fild [0x853A98]: position / lap list width -> fraction
-    const DWORD hudFontWLoad    = 0x4CE5EB;             // mov eax, [0x853A98] (5 bytes): HUD text sizes
     const DWORD hudInv640[3]    = { 0x59967F, 0x5998CB, 0x599953 };
     const DWORD hudSizes[3]     = { 0x599CCB, 0x599CD7, 0x599CDB };
     const DWORD hudX224[2]      = { 0x4D0A30, 0x4D0B66 }; // float immediates (224.0)
@@ -1628,7 +1641,10 @@ static void ScaleLockedFrame() {
     memcpy(src, bits, srcN);
     for (int y = 0; y < g_realH; y++) memset(bits + (size_t)y * pitch, 0, (size_t)g_realW * bp);
     int X0 = XfX(0), Y0 = XfY(0), X1 = XfX(640), Y1 = XfY(480);
-    if (X0 < 0) X0 = 0; if (Y0 < 0) Y0 = 0; if (X1 > g_realW) X1 = g_realW; if (Y1 > g_realH) Y1 = g_realH;
+    if (X0 < 0) X0 = 0;
+    if (Y0 < 0) Y0 = 0;
+    if (X1 > g_realW) X1 = g_realW;
+    if (Y1 > g_realH) Y1 = g_realH;
     for (int y = Y0; y < Y1; y++) {
         int sy = (int)((y - g_xoy) / g_xsy); if (sy < 0) sy = 0; if (sy > 479) sy = 479;
         BYTE* drow = bits + (size_t)y * pitch; const BYTE* srow = src + (size_t)sy * 640 * bp;
@@ -1714,12 +1730,12 @@ static FARPROC WINAPI HkGetProcAddress(HMODULE m, LPCSTR name) {
         { "_THRASH_clip@16", (void**)&g_tClip, (void*)&WrClip },
     };
     for (const W& w : kW) if (!strcmp(name, w.n)) { *w.real = (void*)p; return (FARPROC)w.wr; }
-    if (!strcmp(name, "_THRASH_clearwindow@0")) g_tClear = (TVoid_t)p;
-    if (!strcmp(name, "_THRASH_setvideomode@12")) { g_tSetMode = (TSetMode_t)p; return (FARPROC)&WrSetMode; }
-    if (!strcmp(name, "_THRASH_pageflip@0"))      { g_tFlip = (TVoid_t)p;      return (FARPROC)&WrFlip; }
-    if (!strcmp(name, "_THRASH_lockwindow@0"))    { g_tLock = (TLock_t)p;      return (FARPROC)&WrLock; }
-    if (!strcmp(name, "_THRASH_unlockwindow@4"))  { g_tUnlock = (TUnlock_t)p;  return (FARPROC)&WrUnlock; }
-    if (!strcmp(name, "_THRASH_about@0"))         g_tAbout = (TAbout_t)p;
+    if (!strcmp(name, "_THRASH_clearwindow@0")) g_tClear = (TVoid_t)(void*)p;
+    if (!strcmp(name, "_THRASH_setvideomode@12")) { g_tSetMode = (TSetMode_t)(void*)p; return (FARPROC)(void*)&WrSetMode; }
+    if (!strcmp(name, "_THRASH_pageflip@0"))      { g_tFlip = (TVoid_t)(void*)p;      return (FARPROC)(void*)&WrFlip; }
+    if (!strcmp(name, "_THRASH_lockwindow@0"))    { g_tLock = (TLock_t)(void*)p;      return (FARPROC)(void*)&WrLock; }
+    if (!strcmp(name, "_THRASH_unlockwindow@4"))  { g_tUnlock = (TUnlock_t)(void*)p;  return (FARPROC)(void*)&WrUnlock; }
+    if (!strcmp(name, "_THRASH_about@0"))         g_tAbout = (TAbout_t)(void*)p;
     return p;
 }
 
@@ -1770,7 +1786,6 @@ static void ApplyHud(int W, int H) {
     float x224 = 224.0f + (640.0f * k - 640.0f) * 0.5f;
     for (DWORD at : ws::hudX224) PatchBytes(at, &x224, 4);
 }
-extern "C" int __cdecl WsFontW();
 extern "C" void __cdecl WsAfterRaceMode() {
     int W = Rd<int>(ws::pModeW), H = Rd<int>(ws::pModeH);
     if (W > 0 && H > 0 && (W != g_cfg.wsRaceWidth || H != g_cfg.wsRaceHeight)) {
@@ -1778,8 +1793,8 @@ extern "C" void __cdecl WsAfterRaceMode() {
         ReplaceIniLine("wsRaceWidth", W); ReplaceIniLine("wsRaceHeight", H);
     }
     ApplyHud(W, H);
-    if (g_cfg.wsLog) Logf("widescreen: race at %dx%d - HUD lays out %.0f wide (text %d), Hor+ %s\n",
-                          W, H, g_hudW, WsFontW(), g_cfg.wsFixFOV ? "on" : "off");
+    if (g_cfg.wsLog) Logf("widescreen: race at %dx%d - HUD lays out %.0f wide, Hor+ %s\n",
+                          W, H, g_hudW, g_cfg.wsFixFOV ? "on" : "off");
 }
 
 // HUD rectangles from the layout file: [i*5+j] = 4 fractions (y0,x0,y1,x1) then
@@ -1854,9 +1869,6 @@ extern "C" void WsRaceModeStub();
 extern "C" void WsFrustumStub();
 extern "C" void WsZoomStub();
 extern "C" void WsRectsStub();
-extern "C" void WsFontWStub();
-// (HUD text sizes need nothing extra: their 1/640 constant at 0x59967F is one of hudInv640)
-extern "C" int __cdecl WsFontW() { return (int)lrintf(g_hudW); }
 asm(".text\n"
     ".globl _WsCallSelMode\n"
     "_WsCallSelMode:\n"
@@ -1933,15 +1945,6 @@ asm(".text\n"
     "    call *%eax\n"
     "    call _WsPostRects\n"
     "    popal\n"
-    "    ret\n"
-    // replaces "mov eax, [0x853A98]" in the HUD text size setup 0x4CE5E0
-    ".globl _WsFontWStub\n"
-    "_WsFontWStub:\n"
-    "    pushl %ecx\n"
-    "    pushl %edx\n"
-    "    call _WsFontW\n"
-    "    popl %edx\n"
-    "    popl %ecx\n"
     "    ret\n");
 
 // ---------------------------------------------------------------------------
@@ -2073,6 +2076,7 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
         InitializeCriticalSection(&g_logLock); g_logLockInit = true;
+        InitializeCriticalSection(&g_iniLock); g_iniLockInit = true;
         QueryPerformanceFrequency(&g_qpf);
         LoadConfig();
         OpenLog();
