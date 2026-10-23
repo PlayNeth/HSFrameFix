@@ -1,9 +1,12 @@
-// HSFrameFix.asi  v0.1
-// Frame-rate unlock with interpolation for Need for Speed: High Stakes (PC)
+// HSFrameFix.asi
+// Frame-rate unlock with interpolation, widescreen and fixes for Need for Speed:
+// High Stakes (PC). Version history: CHANGELOG.md.
 //
 // Analysed exe: nfs4.exe SHA-1 8e10048ebc1b962bbe5dd569b48a791eeaafab5c
 // (PE timestamp 0x57334341, image base 0x400000, no ASLR). Every patch site is
-// byte-checked first; on any other exe the ASI does nothing.
+// byte-checked first; on any other exe the ASI does nothing (exeCheck=0 patches
+// anyway; every differing byte range is logged, expected vs found). The
+// widescreen-patched exe is recognised too, and the log names which one runs.
 //
 // How the game keeps time (sim.c main loop at 0x51C6D0):
 //  - A 128 Hz multimedia-timer chain (callback 0x548850, TimerInit(128) at
@@ -20,50 +23,6 @@
 // What this ASI does:
 //  - preciseTicks: drives the 128 Hz chain from a QPC-based scheduler so tick
 //    times are exact (the original uses 1 ms GetTickCount one-shots).
-//  - v0.2: frames are placed on a smoothed simulation clock (follows when steps
-//    arrive, averaged) with a 4-snapshot history, and on a smoothed frame clock,
-//    instead of mapping steps to the 64 Hz counter (that mapping shifted by a
-//    whole step now and then, which showed as flicker/hitches).
-//  - v0.3: camera cuts (switching camera, look back/left/right [0x661968],
-//    jumps too large to blend) draw the frame at the newest step instead of
-//    mixing a newest camera with blended cars (jolt when pressing look back).
-//  - v0.4: menus. Every front-end screen presents through 0x538170: flush,
-//    page flip, then it spins until the 128 Hz tick counter [0x9E6D54] has
-//    advanced by 2 (= 64 fps cap), calling the idle work 0x526460 meanwhile.
-//    unlockMenus replaces that wait with one idle call per frame (plus the
-//    optional limiter), so menus run at the display's refresh rate. Menu
-//    animations are driven by the tick counter, so their speed is unchanged.
-//  - v0.6.6: verified against the original nfs4.exe release (sha256 17a0f96c3bcfb94f...)
-//    as well as the widescreen-patched exe; the log names which one is running.
-//  - v0.6.5: exeCheck=0 patches a modified nfs4.exe anyway; every differing byte
-//    range is logged (expected vs found) either way.
-//  - v0.6.4: menuMaxFPS - menus never run above 128 fps (auto: a divisor of the
-//    refresh rate), since several menu animations speed up past the 128 Hz tick.
-//  - v0.6.3: only the menu item reveal timing is changed; the list-slide and FeFx
-//    timers are original again (a zero step made the list slide end early and loop).
-//  - v0.6.2: v0.6.1's menu timing fix froze menu animations when the tick counter
-//    had been reset (negative elapsed time); negative now resyncs like the original.
-//  - v0.6.1: menu item reveal / glow and two other menu animations no longer run
-//    faster above 64 fps (they counted at least 2 ticks per frame).
-//  - v0.6: glideMenuEffects - the front end's Glide-only effects (menu glow, full
-//    brightness highlight colours, widget timing, a transition render state) on Direct3D.
-//  - v0.5.3: crash / recovery cameras keep the FOV offset of the camera the player
-//    picked ([0x7C3CA8+view*4]) instead of falling back to the global offset only.
-//  - v0.5.2: FOV hotkeys no longer write the ini / log on the game thread (a
-//    background thread saves them), so a burst of key presses can't stall a frame.
-//    The log now says when clamped frames happened.
-//  - v0.5.1: the cockpit model (0x4D1C80) uses its own fixed 80 degree FOV; it now
-//    scales with the in-car FOV offset so the dashboard widens with the world.
-//  - v0.5: loading. The loading bar (0x4E7B80, ~48 calls per race load) does a
-//    full GPU sync (THRASH_sync(0) = lock/unlock) and two vsync'd page flips
-//    every call. speedUpLoading only redraws it every loadScreenRenderMs; the
-//    skipped calls still run its callback poll (0x54A790).
-//    Camera FOV: the game uses one FOV for the whole view, from 0x539E10
-//    (90 deg, 75 with the narrow view-angle option, +15 in some modes). Its
-//    three callers inside the view setup (0x539F80, view in [ebp-4]) are
-//    redirected so a per-camera offset is added (camera type of that view's
-//    active camera; the rear-view mirror is left alone). F6/F7/F8 change the
-//    current camera's offset in race and save it to the ini.
 //  - interpolate: after every sim step it snapshots the transforms of all cars
 //    (pos car+8, rotation car+0x34), all camera objects (pos cam+0x14,
 //    rotation cam+0x2C, table 0x660DF0) and the helicopter (position). Before
@@ -73,6 +32,39 @@
 //  - The main loop's "nothing new, skip render" branch (0x51CB6C) now renders
 //    an interpolated frame instead, so the frame rate follows the display
 //    (vsync) or the optional limiter instead of the 64 Hz sim.
+//  - Frames are placed on a smoothed simulation clock (follows when steps
+//    arrive, averaged) with a 4-snapshot history, and on a smoothed frame clock;
+//    mapping steps to the 64 Hz counter would shift by a whole step now and then.
+//  - Camera cuts (switching camera, look back/left/right [0x661968], jumps too
+//    large to blend) draw the frame at the newest step instead of mixing a
+//    newest camera with blended cars.
+//  - Menus: every front-end screen presents through 0x538170: flush, page flip,
+//    then it spins until the 128 Hz tick counter [0x9E6D54] has advanced by 2
+//    (= 64 fps cap), calling the idle work 0x526460 meanwhile. unlockMenus
+//    replaces that wait with one idle call per frame (plus the optional
+//    limiter). Menu animations are driven by the tick counter, so their speed
+//    is unchanged; only the menu item reveal timing is adjusted so it doesn't
+//    count at least 2 ticks per frame. menuMaxFPS keeps menus at or below
+//    128 fps (auto: a divisor of the refresh rate), since several menu
+//    animations speed up past the 128 Hz tick.
+//  - glideMenuEffects: the front end's Glide-only effects (menu glow, full
+//    brightness highlight colours, widget timing, a transition render state)
+//    on Direct3D.
+//  - Loading: the loading bar (0x4E7B80, ~48 calls per race load) does a full
+//    GPU sync (THRASH_sync(0) = lock/unlock) and two vsync'd page flips every
+//    call. speedUpLoading only redraws it every loadScreenRenderMs; the
+//    skipped calls still run its callback poll (0x54A790).
+//  - Camera FOV: the game uses one FOV for the whole view, from 0x539E10
+//    (90 deg, 75 with the narrow view-angle option, +15 in some modes). Its
+//    three callers inside the view setup (0x539F80, view in [ebp-4]) are
+//    redirected so a per-camera offset is added (camera type of that view's
+//    active camera; the rear-view mirror is left alone). Crash / recovery
+//    cameras keep the offset of the camera the player picked
+//    ([0x7C3CA8+view*4]). The cockpit model (0x4D1C80) uses its own fixed
+//    80 degree FOV; it scales with the in-car offset. F6/F7/F8 change the
+//    current camera's offset in race; a background thread saves it to the ini.
+//  - Widescreen: see the Widescreen section.
+//  - closeExits: closing the window from outside ends the process.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -216,7 +208,7 @@ struct Config {
     int   menuMaxFPS       = -1;    // -1 = auto (<= 128, divides the refresh rate), 0 = none
     int   logToFile        = 1;
     int   logEverySeconds  = 10;
-    // widescreen (v0.7)
+    // widescreen
     int   widescreen       = 1;
     int   wsMenus          = 1;     // 0 = original 640x480 mode, 1 = 4:3 centered, 2 = stretched
     int   wsMenuResolution = 1;     // 1 = race resolution, 2 = desktop resolution
@@ -1415,7 +1407,7 @@ static void InstallInterpolation() {
 }
 
 // ---------------------------------------------------------------------------
-// Widescreen (v0.7)
+// Widescreen
 //
 // Menus: the front end always runs in display mode 1 (640x480; [0x5BEF9C]) and
 // draws in 640x480 pixels. The menu mode set (0x51A710 from 0x4F773B / 0x504999)
