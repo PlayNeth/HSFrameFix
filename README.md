@@ -22,11 +22,13 @@ The game simulates at a fixed 64 Hz and only draws a frame after each simulation
 
 ## Requirements
 
-- **Need for Speed: High Stakes** for PC, with `nfs4.exe`: the original release (SHA-1 `8e10048ebc1b962bbe5dd569b48a791eeaafab5c`) or the widescreen-patched exe. The exe's own widescreen patch is undone at startup, because this mod replaces it.
+- **Need for Speed: High Stakes** for PC, version 4.50, with one of these `nfs4.exe` builds:
+  - the official 4.50 patch, unmodified (SHA-1 `b966f01d8d11e27f6d3167b8ec1ad3e3c2d30148`);
+  - VEG's 4.50 patch (SHA-1 `8e10048ebc1b962bbe5dd569b48a791eeaafab5c`). Its built-in widescreen patch is undone at startup, because this mod replaces it.
 - An **ASI loader**, such as [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader).
 - One of the tested renderers:
   - **Direct3D 7**, with the `dx7a.dll` driver from Porsche Unleashed;
-  - **Glide**, through nGlide;
+  - **Glide**, through [gl2d9](https://github.com/PlayNeth/gl2d9);
   - the **software renderer** (`softtria.dll`), where menus stay 640×480.
 
 It runs on Windows, and on Linux through Wine or Proton.
@@ -115,7 +117,7 @@ All next to the `.asi`:
 ## Troubleshooting
 
 - **Nothing changed, and there's no `HSFrameFix.log`:** the ASI loader isn't loading. Check its instructions for this game, and that `HSFrameFix.asi` is in the game's folder or the loader's `scripts` folder.
-- **The log says the exe differs and the mod is off:** your `nfs4.exe` isn't one the mod was made for. Check it against the SHA-1 above. The mod leaves the game alone to be safe.
+- **The log says the exe differs, or isn't a supported build, and the mod is off:** your `nfs4.exe` isn't one of the two builds above. Check it against the SHA-1s under Requirements. The mod leaves the game alone to be safe.
 - **Occasional hitches:** raise `interpDelay` to `1.5`.
 - **Tearing, or the frame rate runs too high:** turn on v-sync, or set `targetFPS` to your refresh rate.
 - **Menus stay 640×480:** that's expected on the software renderer.

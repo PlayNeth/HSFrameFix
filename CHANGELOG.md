@@ -9,7 +9,7 @@ HSFrameFix is an ASI plugin for **Need for Speed: High Stakes** (`nfs4.exe`):
 - Glide menu effects on any renderer;
 - seamless widescreen.
 
-Works with the original `nfs4.exe` release and with the widescreen-patched exe. The exe's built-in widescreen patch is undone at startup, because this mod replaces it. On any other exe, the mod leaves the game alone.
+Works with the official 4.50 patch (unmodified) and with VEG's 4.50 patch. VEG's built-in widescreen patch is undone at startup, because this mod replaces it. On any other exe, the mod leaves the game alone.
 
 Tested renderers:
 - Direct3D 7, using the `dx7a.dll` driver from Porsche Unleashed.
@@ -17,6 +17,13 @@ Tested renderers:
 - The software renderer, with the limits described under 0.7.7.
 
 ---
+
+## 0.7.15: official 4.50 patch supported
+
+- **Official 4.50 patch:** the unmodified `nfs4.exe` of the official 4.50 patch (SHA-1 `b966f01d8d11e27f6d3167b8ec1ad3e3c2d30148`) is now supported.
+- **VEG's patch:** still supported (SHA-1 `8e10048ebc1b962bbe5dd569b48a791eeaafab5c`). Its built-in widescreen patch is still undone at startup.
+- **Dropped:** VEG's exe with its widescreen patch removed is no longer supported. The mod now leaves it alone, like any other unknown exe (`exeCheck=0` still patches it anyway).
+- **Exe check:** the log names which of the two builds is running. Earlier versions called VEG's exe the "original release".
 
 ## 0.7.14: code review fixes
 

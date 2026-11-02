@@ -2,11 +2,16 @@
 // Frame-rate unlock with interpolation, widescreen and fixes for Need for Speed:
 // High Stakes (PC). Version history: CHANGELOG.md.
 //
-// Analysed exe: nfs4.exe SHA-1 8e10048ebc1b962bbe5dd569b48a791eeaafab5c
-// (PE timestamp 0x57334341, image base 0x400000, no ASLR). Every patch site is
-// byte-checked first; on any other exe the ASI does nothing (exeCheck=0 patches
-// anyway; every differing byte range is logged, expected vs found). The
-// widescreen-patched exe is recognised too, and the log names which one runs.
+// Supported exes (both version 4.50, image base 0x400000, no ASLR):
+//  - the official 4.50 patch, unmodified: SHA-1 b966f01d8d11e27f6d3167b8ec1ad3e3c2d30148
+//    (PE timestamp 0x3A8D8E0A);
+//  - VEG's patched 4.50: SHA-1 8e10048ebc1b962bbe5dd569b48a791eeaafab5c (PE
+//    timestamp 0x57334341). It changes code in place (CPU detection, startup,
+//    a built-in widescreen patch) but none of the bytes this mod uses; its
+//    widescreen patch is undone at startup, because this mod replaces it.
+// Every patch site is byte-checked first, then the build is identified; on any
+// other exe the ASI does nothing (exeCheck=0 patches anyway; every differing
+// byte range is logged, expected vs found). The log names which build runs.
 //
 // How the game keeps time (sim.c main loop at 0x51C6D0):
 //  - A 128 Hz multimedia-timer chain (callback 0x548850, TimerInit(128) at
@@ -80,7 +85,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.14"
+#define HSFF_VERSION "0.7.15"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -534,13 +539,31 @@ static bool CheckExe() {
              (unsigned long)s.addr, exp, got);
     }
     if (!bad) {
-        // Two known builds share every byte the mod uses: the original 1999 release
-        // (sha256 17a0f96c...) and the same exe with a widescreen patch, which hooks
-        // the projection setup (0x53A086 jmp instead of fstp [0x5B0954]).
+        // Two supported builds share every byte the mod uses. They are told apart
+        // by VEG's changes: its CPU detection rewrite at 0x41F405 (mov eax,
+        // [0x5C3AAC] instead of the original cmp dword [0x5C3950], 0) and its
+        // widescreen patch, which hooks the projection setup (0x53A086 jmp instead
+        // of fstp [0x5B0954]). A VEG exe without its widescreen patch, or any
+        // other mix, is not supported.
+        const BYTE* c = (const BYTE*)0x41F405;
         const BYTE* w = (const BYTE*)0x53A086;
-        const char* variant = (w[0] == 0xD9 && w[1] == 0x1D) ? "original release"
-                            : (w[0] == 0xE9) ? "with widescreen patch" : "unknown variant";
-        Logf("exe check: nfs4.exe matches (%d checks, %s)\n", total, variant);
+        bool vegCode = c[0] == 0xA1, vanCode = c[0] == 0x83 && c[1] == 0x3D;
+        bool vegWs = w[0] == 0xE9, vanWs = w[0] == 0xD9 && w[1] == 0x1D;
+        if (vanCode && vanWs) {
+            Logf("exe check: nfs4.exe matches (%d checks, official 4.50 patch)\n", total);
+            return true;
+        }
+        if (vegCode && vegWs) {
+            Logf("exe check: nfs4.exe matches (%d checks, VEG's 4.50 patch)\n", total);
+            return true;
+        }
+        Logf("exe check: all %d checks match, but this isn't a supported build "
+             "(0x41F405: %02X %02X, 0x53A086: %02X %02X)\n", total, c[0], c[1], w[0], w[1]);
+        if (g_cfg.exeCheck) {
+            Logf("exe check: mod disabled (exeCheck=0 in the ini patches anyway)\n");
+            return false;
+        }
+        Logf("exe check: exeCheck=0, patching anyway\n");
         return true;
     }
     if (g_cfg.exeCheck) {
@@ -1425,7 +1448,7 @@ static void InstallInterpolation() {
 // those use the 4:3 width instead, and the element rectangles of the layout
 // file (0x7CB0BC, built by 0x4D0550) are placed in 4:3 proportions at the left,
 // right or middle of the screen. The rear-view mirror uses one of them.
-// A widescreen patch already in the exe (jumps at the sites below) is undone first.
+// VEG's widescreen patch, already in its exe (jumps at the sites below), is undone first.
 // ---------------------------------------------------------------------------
 namespace ws {
     const DWORD fnSetMode       = 0x51A710;
@@ -1452,7 +1475,7 @@ namespace ws {
     const DWORD fnLookup        = 0x51A530;
 
     struct Restore { DWORD addr; const char* orig; int len; };
-    const Restore kOtherPatch[] = {        // original bytes at the other widescreen patch's sites
+    const Restore kOtherPatch[] = {        // original bytes at the sites of VEG's widescreen patch
         { 0x453F5D, "\xDD\xD8\xD8\x7D\x10", 5 },
         { 0x46D71C, "\xA3\x0C\x95\x68\x00", 5 },
         { 0x4CE753, "\xDB\x05\x98\x3A\x85\x00", 6 },
@@ -1979,7 +2002,7 @@ static void InstallCloseFix() {
 static void InstallWidescreen() {
     g_dispW = GetSystemMetrics(SM_CXSCREEN); g_dispH = GetSystemMetrics(SM_CYSCREEN);
     if (!g_knownExe || !g_cfg.widescreen) { Logf("widescreen: off\n"); return; }
-    // another widescreen patch in the exe: put its sites back first
+    // VEG's exe has its own widescreen patch: put its sites back first
     if (*(BYTE*)0x53A086 == 0xE9) {
         bool ok = true;
         for (const auto& r : ws::kOtherPatch) ok &= PatchBytes(r.addr, r.orig, r.len);
