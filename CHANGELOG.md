@@ -9,7 +9,7 @@ HSFrameFix is an ASI plugin for **Need for Speed: High Stakes** (`nfs4.exe`):
 - Glide menu effects on any renderer;
 - seamless widescreen.
 
-Works with the official 4.50 patch (unmodified) and with VEG's 4.50 patch. VEG's built-in widescreen patch is undone at startup, because this mod replaces it. On any other exe, the mod leaves the game alone.
+Works with the official 4.50 patch (unmodified, or with its CD check removed) and with VEG's 4.50 patch. VEG's built-in widescreen patch is undone at startup, because this mod replaces it. On any other exe, the mod leaves the game alone.
 
 Tested renderers:
 - Direct3D 7, using the `dx7a.dll` driver from Porsche Unleashed.
@@ -17,6 +17,22 @@ Tested renderers:
 - The software renderer, with the limits described under 0.7.7.
 
 ---
+
+## 0.8.0: the unmodified official exe, portable install, no CD check, no disk space check
+
+- **The official exe, really unmodified:** the `nfshs.exe` inside EA's `NFSHSpatch4_50.exe` (SHA-1 `ac4f57ad3588161e0e0dd3ab582f7ad1f4d532eb`) is now the main supported exe.
+- **Correction:** the exe that 0.7.15 called "the official 4.50 patch, unmodified" (SHA-1 `b966f01d8d11e27f6d3167b8ec1ad3e3c2d30148`) is that exe with its CD check removed: 7 bytes differ. It is still supported, and the log says which of the two is running.
+- **No CD check (`noCDCheck=1`):** the official exe asks for the game CD twice at startup. The mod now skips both, by making the same change the CD-less exe has. On the other supported exes there is nothing to skip.
+- **No disk space check (`noDiskSpaceCheck=1`):** on today's big disks the game's free-space test overflows and says "Your hard drive has less than 1MB free space". The test now always passes.
+- **"Invalid argument" at startup fixed:** the official exe can stop at startup with a box titled "Invalid argument" listing its switches, although it was started with no arguments. It tests a value it never set. The mod makes that case pass. VEG's exe already had this fixed.
+- **Portable install (`portableInstall=1`):** the game reads where it is installed from the Windows registry, and stops with "files are corrupted; please re-install" when the entries are missing. The mod now answers from the folder the game's exe is in, so the game runs from any folder with no registry entries. Music and movies come from the game folder if `Data\Audio\Music` and `Data\Movies` are there, otherwise from the CD drive the registry names.
+- **`language` and `renderer`:** used when the registry has no language or renderer setting; `renderer` can also override it (`d3d`, `software`, `voodoo`, `voodoo2`).
+- **Sharper 2D on Direct3D (`alternatePixelCenter=1`):** every vertex is moved half a pixel up and left, so menus, HUD and text land exactly on the pixels. Brought over from HPFrameFix. Works with `widescreen=0` too.
+- **Sound crackling and pops (`gameThreadsOneCore=1`, `widenAffinity=1`):** the game's own threads, and its sound driver's, now run on one CPU core, while the system's sound threads keep the others. The game's sound code was written for one CPU. Brought over from HPFrameFix.
+- **`driversFolder`:** the renderer DLLs can be kept in a folder of their own. Empty (the default) means the game folder, as before. Brought over from HPFrameFix.
+- **Menu resolution:** with `wsMenuResolution=1` the menus now always use the resolution chosen in the game's options, and at startup the one used last time. Before, they fell back to the desktop's resolution at startup and whenever 640x480 was chosen. The desktop's is only used with `wsMenuResolution=2`.
+- **`HSFrameFix.ini` in sections:** a new file is grouped into sections (Frame rate, Menus, Loading, Camera, Graphics, Widescreen, Sound, Fixes, Portable, Advanced), with a note above every setting. Defaults are unchanged.
+- **Existing ini files are left alone:** a file from an older version keeps its layout and your values. Any setting it does not have yet is added at the end, with its note, under one heading. Before, settings were added a whole group at a time, and one (`closeExits`) was never added to older files. To get the new layout, delete `HSFrameFix.ini`; the mod writes a fresh one at the next start.
 
 ## 0.7.15: official 4.50 patch supported
 

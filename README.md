@@ -23,7 +23,8 @@ The game simulates at a fixed 64 Hz and only draws a frame after each simulation
 ## Requirements
 
 - **Need for Speed: High Stakes** for PC, version 4.50, with one of these `nfs4.exe` builds:
-  - the official 4.50 patch, unmodified (SHA-1 `b966f01d8d11e27f6d3167b8ec1ad3e3c2d30148`);
+  - the official 4.50 patch, unmodified: the `nfshs.exe` inside EA's `NFSHSpatch4_50.exe` (SHA-1 `ac4f57ad3588161e0e0dd3ab582f7ad1f4d532eb`). This is the main one. The mod removes its CD check and its free disk space check at startup;
+  - the same exe with its CD check already removed (SHA-1 `b966f01d8d11e27f6d3167b8ec1ad3e3c2d30148`). Versions up to 0.7.15 listed this one as "unmodified";
   - VEG's 4.50 patch (SHA-1 `8e10048ebc1b962bbe5dd569b48a791eeaafab5c`). Its built-in widescreen patch is undone at startup, because this mod replaces it.
 - An **ASI loader**, such as [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader).
 - One of the tested renderers:
@@ -80,7 +81,7 @@ Almost everything can be switched off or adjusted in `HSFrameFix.ini`.
 
 ## Settings
 
-**`HSFrameFix.ini`** is next to the `.asi`. Every setting has a comment saying what it does. The most useful ones:
+**`HSFrameFix.ini`** is next to the `.asi`. It is grouped into sections and every setting has a note saying what it does. A file from an older version keeps its layout (new settings are added at its end); delete it to get a fresh one. The most useful settings:
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -95,12 +96,21 @@ Almost everything can be switched off or adjusted in `HSFrameFix.ini`.
 | `glideMenuEffects` | `1` | Glide's menu glow effects on every renderer. |
 | `widescreen` | `1` | Master switch for the widescreen features. |
 | `wsMenus` | `1` | `1` menus 4:3 in the middle, `2` stretched, `0` the original 640×480. |
-| `wsMenuResolution` | `1` | `1` menus at the race resolution, `2` at the desktop's. |
+| `wsMenuResolution` | `1` | `1` menus at the resolution chosen in the game's options (at startup, the one used last time), `2` at the desktop's. |
 | `wsFixFOV` | `1` | The Hor+ 3D view. |
 | `wsHud` | `1` | `1` 4:3 HUD anchored to the screen edges, `2` 4:3 HUD in the middle, `0` the original (stretched). |
 | `wsMovies` | `1` | Scales intro movies like the menus. |
 | `wsUnlockResolutions` | `1` | Lists non-4:3 resolutions in the options. |
 | `closeExits` | `1` | Closing the window from outside ends the game. |
+| `noCDCheck` | `1` | The game doesn't ask for its CD at startup (the official 4.50 exe does). |
+| `portableInstall` | `1` | The game finds its files from the folder its exe is in. No registry entries are needed (without them the game says "files are corrupted; please re-install"), and the game folder can be copied or moved. Music and movies are read from the game folder if `Data\Audio\Music` and `Data\Movies` are there, else from the CD drive the registry names. |
+| `language` | `english` | Used when the registry has no language: `english`, `german`, `french`, `spanish`, `italian`, `swedish`. |
+| `renderer` | empty | `d3d` (`d3da.dll`), `software` (`softtria.dll`), `voodoo` or `voodoo2` (both `voodoo2a.dll`). Empty = the registry's setting (`d3da.dll` if it has none). |
+| `alternatePixelCenter` | `1` | Direct3D only: every vertex is moved half a pixel up and left, so menus, HUD and text land exactly on the pixels and come out sharp. |
+| `gameThreadsOneCore` | `1` | The game's own threads (main, sound, streaming) run on one CPU core, which stops the sound crackling and popping on today's CPUs. The system's threads keep the other cores. |
+| `widenAffinity` | `1` | If the whole game was started on one core (`taskset`, a launcher option), it gets all cores back and only its own threads stay on one. Needs `gameThreadsOneCore=1`. |
+| `driversFolder` | empty | Folder the renderer DLLs (`d3da.dll`, `softtria.dll`, `voodoo2a.dll`) are loaded from: a folder in the game folder, or a full path. A DLL that isn't there is loaded from the game folder. Empty = the game folder. |
+| `noDiskSpaceCheck` | `1` | No test for free disk space at startup. On today's disks the game's test goes wrong and says "Your hard drive has less than 1MB free space". |
 | `exeCheck` | `1` | Turns the mod off if the exe differs; `0` patches anyway (only for a modified exe you know is the same version). |
 
 [CHANGELOG.md](CHANGELOG.md) has the version history.
@@ -117,7 +127,7 @@ All next to the `.asi`:
 ## Troubleshooting
 
 - **Nothing changed, and there's no `HSFrameFix.log`:** the ASI loader isn't loading. Check its instructions for this game, and that `HSFrameFix.asi` is in the game's folder or the loader's `scripts` folder.
-- **The log says the exe differs, or isn't a supported build, and the mod is off:** your `nfs4.exe` isn't one of the two builds above. Check it against the SHA-1s under Requirements. The mod leaves the game alone to be safe.
+- **The log says the exe differs, or isn't a supported build, and the mod is off:** your `nfs4.exe` isn't one of the builds above. Check it against the SHA-1s under Requirements. The mod leaves the game alone to be safe.
 - **Occasional hitches:** raise `interpDelay` to `1.5`.
 - **Tearing, or the frame rate runs too high:** turn on v-sync, or set `targetFPS` to your refresh rate.
 - **Menus stay 640×480:** that's expected on the software renderer.

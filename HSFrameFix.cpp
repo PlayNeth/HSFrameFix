@@ -2,9 +2,14 @@
 // Frame-rate unlock with interpolation, widescreen and fixes for Need for Speed:
 // High Stakes (PC). Version history: CHANGELOG.md.
 //
-// Supported exes (both version 4.50, image base 0x400000, no ASLR):
-//  - the official 4.50 patch, unmodified: SHA-1 b966f01d8d11e27f6d3167b8ec1ad3e3c2d30148
-//    (PE timestamp 0x3A8D8E0A);
+// Supported exes (all version 4.50, image base 0x400000, no ASLR):
+//  - the official 4.50 patch, unmodified (nfshs.exe in EA's NFSHSpatch4_50.exe):
+//    SHA-1 ac4f57ad3588161e0e0dd3ab582f7ad1f4d532eb (PE timestamp 0x3A8D8E0A).
+//    This is the main one;
+//  - the same exe with its CD check removed, 7 bytes changed (0x4F7F24: jne
+//    -> jmp, 0x4F80C7: a call -> nops): SHA-1
+//    b966f01d8d11e27f6d3167b8ec1ad3e3c2d30148. Versions up to 0.7.15 called
+//    this one "unmodified";
 //  - VEG's patched 4.50: SHA-1 8e10048ebc1b962bbe5dd569b48a791eeaafab5c (PE
 //    timestamp 0x57334341). It changes code in place (CPU detection, startup,
 //    a built-in widescreen patch) but none of the bytes this mod uses; its
@@ -68,8 +73,50 @@
 //    ([0x7C3CA8+view*4]). The cockpit model (0x4D1C80) uses its own fixed
 //    80 degree FOV; it scales with the in-car offset. F6/F7/F8 change the
 //    current camera's offset in race; a background thread saves it to the ini.
+//  - HSFrameFix.ini: a new file is kIniText, in sections. An existing file is
+//    left as it is; each setting it lacks is added at its end with its notes
+//    (AppendMissingKeys), so a file from any older version keeps working.
 //  - Widescreen: see the Widescreen section.
 //  - closeExits: closing the window from outside ends the process.
+//  - gameThreadsOneCore / widenAffinity: see "Game threads on one core".
+//  - driversFolder: the renderer DLL from a folder of its own (see HkLoadLibraryA).
+//  - noCDCheck: the official exe checks for the game CD twice at startup.
+//    0x4F7F1D: 0x4F7FE0 asks MCI "status cdaudio ready"; unless that's "true"
+//    it shows "Please Insert Game Disk" and asks again, and after it the game
+//    looks for D:\Data\Audio\Music\Credits.asf, counting the drive letter
+//    up. 0x4F80C7: 0x504B70 shows "you must first install" / "must have the
+//    game CD in the CD-ROM drive" unless a drive holds NfsHs.exe. The two
+//    sites get the bytes the CD-less exe has there (jne 0x4F7F48 -> jmp
+//    0x4F7FA5; the call -> nops), and only if they still hold the original's.
+//  - Startup arguments: the argument reader (0x4F8320; the only switch is
+//    -PatchRestart) leaves its "argument was valid" variable [ebp-0x14] unset
+//    when there are no arguments, and then tests it (0x4F833A: je 0x4F8432).
+//    Whatever the stack holds decides: zero, and the game shows its "Invalid
+//    argument" list of switches and quits. VEG's exe sets the variable first.
+//    Here that je goes straight to the function's "fine" exit (0x4F85B1): it's
+//    only taken with no arguments, or when all of them were valid.
+//  - portableInstall: the game takes where it's installed from the registry
+//    (0x4FC6E0, called at 0x4F80A2; any value missing = "files are corrupted;
+//    please re-install"). Under HKLM: "Path" in the App Paths key of NfsHs.exe
+//    (the install folder), and in "SOFTWARE\Electronic Arts\Need For Speed High
+//    Stakes\1.0" the values "instLev" (0, 1 or 2: how much was copied from the
+//    CD) and "SrcDrive" (the CD). From those it fills 15 folder paths
+//    (0x826590, 0x104 bytes each; names at [0x5BD2DC], kinds at [0x5BD35C]):
+//    kind 0 always in the install folder, 1 there if instLev >= 1, 2 there if
+//    instLev = 2, 4 (Data/Audio/Music, Data/Movies) always on SrcDrive.
+//    0x4FCA10 reads "Language" there too (2 French, 3 German, 4 Italian, 5
+//    Spanish, 6 Swedish, else English), and 0x504C90 reads "Thrash Driver"
+//    and "D3D Device" from the key above it. "Thrash Driver" is the renderer
+//    DLL's file name: 0x503F9B compares it, as far as it goes and with case,
+//    with the DLL names of the table at 0x5BE7AC (12 bytes an entry: display
+//    name, DLL, number - Softtri softtria.dll, 3Dfx Voodoo voodoo2a.dll, 3Dfx
+//    Voodoo 2 voodoo2a.dll, Direct3D d3da.dll); no match is Warning #2. The
+//    registry calls the game imports are wrapped and answer
+//    those values from the game's own folder: see the portable install section.
+//  - noDiskSpaceCheck: 0x49E800 (eax = bytes wanted; 1 if the drive has them
+//    free) multiplies the three GetDiskFreeSpace numbers with 32-bit imul and
+//    compares signed, so a big disk fails it ("Your hard drive has less than
+//    1MB free space"). It becomes "mov eax, 1 / ret".
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -85,7 +132,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HSFF_VERSION "0.7.15"
+#define HSFF_VERSION "0.8.0"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -132,6 +179,8 @@ namespace hs {
 
     struct Sig { DWORD addr; const char* bytes; int len; };
     const Sig kSigs[] = {
+        { 0x49E800, "\x52\x55\x89\xE5\x81\xEC\x1C\x01\x00\x00", 10 },          // free disk space test
+        { 0x504530, "\x51\x56\x57\x55\x89\xE5\x83\xEC\x3C", 9 },                // the "files are corrupted" box
         { 0x548850, "\x53\x56\x57\x8B\x15\x2C\x6D\x9E\x00\xA1\x00\x6D", 12 }, // timer callback
         { 0x548A46, "\xA3\x00\x6D\x9E\x00", 5 },                              // period store
         { 0x459E7B, "\xB8\x10\x9E\x45\x00", 5 },                              // register handler
@@ -209,20 +258,29 @@ struct Config {
     int   fovKeyReset      = 0x75;  // F6
     int   fovStep          = 1;
     int   glideMenuEffects = 1;
-    int   exeCheck         = 1;     // 1 = turn the mod off if nfs4.exe differs, 0 = patch anyway
+    int   exeCheck         = 1;     // 1 = turn the mod off if the exe differs, 0 = patch anyway
     int   menuMaxFPS       = -1;    // -1 = auto (<= 128, divides the refresh rate), 0 = none
     int   logToFile        = 1;
     int   logEverySeconds  = 10;
     // widescreen
     int   widescreen       = 1;
     int   wsMenus          = 1;     // 0 = original 640x480 mode, 1 = 4:3 centered, 2 = stretched
-    int   wsMenuResolution = 1;     // 1 = race resolution, 2 = desktop resolution
+    int   wsMenuResolution = 1;     // 1 = the resolution chosen in the options, 2 = the desktop's
     int   wsFixFOV         = 1;     // Hor+ 3D
     int   wsHud            = 1;     // 0 = original (stretched), 1 = 4:3 at the screen edges, 2 = 4:3 centered
     int   wsMovies         = 1;     // scale FMVs with the menus
     int   wsUnlockResolutions = 1;  // list non-4:3 display modes
     int   wsLog            = 1;
     int   closeExits       = 1;     // closing the window (Alt+F4, window manager) ends the game
+    int   noCDCheck        = 1;     // skip the official exe's two startup CD checks
+    int   alternatePixelCenter = 1; // Direct3D: every vertex half a pixel up and left
+    int   gameThreadsOneCore = 1;   // the game's threads share one core (sound races)
+    int   widenAffinity    = 1;     // a process pinned to one core gets all cores back; only the game's threads stay on one
+    int   portableInstall  = 1;     // install folder, level and CD drive answered from the game's own folder
+    char  language[16]     = "english";   // used when the registry has no Language
+    char  driversFolder[MAX_PATH] = "";   // renderer DLLs; "" = game folder
+    char  renderer[16]     = "";    // d3d, software, voodoo, voodoo2; "" = the registry's (d3da.dll if it has none)
+    int   noDiskSpaceCheck = 1;     // skip the "less than 1MB free" test (wrong on big disks)
     int   wsRaceWidth      = 0;     // remembered race resolution (the game only saves the width)
     int   wsRaceHeight     = 0;
 };
@@ -241,59 +299,251 @@ static void InitAsiDir() {
     g_asiDir[0] = 0;
 }
 
-static const char kNewKeysBlock[] =
-    "; --- loading: redraw the loading bar at most every N ms (0 = every call) ---\n"
+// The whole file, as a new one is written. It is also where the notes come from
+// when a setting is missing from an existing file (AppendMissingKeys).
+static const char kIniText[] =
+    "; HSFrameFix.ini (v" HSFF_VERSION ")\n"
+    ";\n"
+    "; Lines starting with ; are notes. For on/off settings 1 = on, 0 = off.\n"
+    "; Delete this file to get a fresh one with the defaults.\n"
+    "\n"
+    "\n"
+    "[Frame rate]\n"
+    "\n"
+    "; Draw frames at the display's refresh rate, blending car and camera motion between\n"
+    "; the game's fixed 64 steps a second. 0 = the game's 64 fps cap\n"
+    "interpolate=1\n"
+    "\n"
+    "; Smooth the police helicopter's movement too\n"
+    "interpolateCopter=1\n"
+    "\n"
+    "; Run the game's 128 Hz timer from a precise clock. Needed for smooth blending\n"
+    "preciseTicks=1\n"
+    "\n"
+    "; Frame limiter for races. 0 = off (use vsync). Without vsync, set it to your\n"
+    "; display's refresh rate\n"
+    "targetFPS=0\n"
+    "\n"
+    "; How many 1/64 s steps behind the newest step frames are drawn. 1.0 is smooth with\n"
+    "; the least delay; try 1.5 if you still see hitches\n"
+    "interpDelay=1.0\n"
+    "\n"
+    "; Movement bigger than this in one step isn't blended (resets, camera cuts):\n"
+    "; a distance in metres, and an angle in degrees\n"
+    "maxStepDistance=10\n"
+    "maxStepAngle=90\n"
+    "\n"
+    "\n"
+    "[Menus]\n"
+    "\n"
+    "; Drop the game's 64 fps cap in the menus\n"
+    "unlockMenus=1\n"
+    "\n"
+    "; Frame limiter for the menus: -1 = same as targetFPS, 0 = off (use vsync), N = N fps\n"
+    "menuTargetFPS=-1\n"
+    "\n"
+    "; Highest frame rate in the menus. Their animations count time in 1/128 s, and some\n"
+    "; (list slide, video walls) speed up above 128 fps.\n"
+    ";   -1 = automatic: the highest rate up to 128 that divides the refresh rate\n"
+    ";        (120 Hz -> 120, 144 Hz -> 72, 240 Hz -> 120)\n"
+    ";    0 = no ceiling\n"
+    ";    N = at most N fps\n"
+    "menuMaxFPS=-1\n"
+    "\n"
+    "; The extra effects the game only draws on its Glide renderer (glow on menu items,\n"
+    "; full-brightness highlights) on Direct3D too\n"
+    "glideMenuEffects=1\n"
+    "\n"
+    "\n"
+    "[Loading]\n"
+    "\n"
+    "; Faster loading: the loading bar is redrawn at most every loadScreenRenderMs\n"
+    "; milliseconds instead of at every step (0 = at every step)\n"
     "speedUpLoading=1\n"
     "loadScreenRenderMs=100\n"
-    "; --- camera FOV (degrees added to the game's FOV; negative = narrower) ---\n"
-    "; fovOffset applies to every race camera, the others to one camera each\n"
+    "\n"
+    "\n"
+    "[Camera]\n"
+    "\n"
+    "; Degrees added to the game's field of view (negative = narrower). fovOffset applies\n"
+    "; to every race camera, the others to one camera each\n"
     "fovOffset=0\n"
     "fovOffsetInCar=0\n"
     "fovOffsetBumper=0\n"
     "fovOffsetHeli=0\n"
     "fovOffsetRoof=0\n"
-    "; in race: F8 = wider, F7 = narrower, F6 = reset, for the camera you're in (saved here)\n"
-    "; keys are Windows virtual-key codes (F1..F12 = 0x70..0x7B; avoid F10)\n"
+    "\n"
+    "; In a race: F8 = wider, F7 = narrower, F6 = reset, for the camera you're in. The\n"
+    "; result is saved in the lines above\n"
     "fovHotkeys=1\n"
+    "\n"
+    "; The keys, as Windows virtual-key codes (F1..F12 = 0x70..0x7B; avoid F10), and how\n"
+    "; many degrees one press changes\n"
     "fovKeyUp=0x77\n"
     "fovKeyDown=0x76\n"
     "fovKeyReset=0x75\n"
-    "fovStep=1\n";
-static const char kGlideBlock[] =
-    "; --- menus: the extra effects the game only draws on its Glide renderer (glow on\n"
-    ";     menu items, full-brightness highlights, ...), also on Direct3D drivers ---\n"
-    "glideMenuEffects=1\n";
-static const char kMenuMaxBlock[] =
-    "; --- menus: frame rate ceiling. The menu code counts time in 1/128 s ticks and some\n"
-    ";     animations (list slide, video walls) speed up above 128 fps.\n"
-    ";     -1 = auto: the highest rate <= 128 that divides your refresh rate (120 Hz -> 120,\n"
-    ";     144 Hz -> 72, 240 Hz -> 120); 0 = no ceiling; N = at most N fps ---\n"
-    "menuMaxFPS=-1\n";
-static const char kExeCheckBlock[] =
-    "; --- exe check: the mod compares the bytes it patches with the nfs4.exe it was made\n"
-    ";     for. 1 = if anything differs, turn the mod off; 0 = patch anyway (every\n"
-    ";     difference is still written to the log). Only use 0 with a modified exe you\n"
-    ";     know is the same version - patching the wrong code can crash the game ---\n"
-    "exeCheck=1\n";
-static const char kWsBlock[] =
-    "; --- widescreen (v0.7): pick any resolution in the game's options ---\n"
+    "fovStep=1\n"
+    "\n"
+    "\n"
+    "[Graphics]\n"
+    "\n"
+    "; Renderer:\n"
+    ";   d3d      = Direct3D (d3da.dll)\n"
+    ";   software = software renderer (softtria.dll)\n"
+    ";   voodoo or voodoo2 = 3dfx Glide (voodoo2a.dll)\n"
+    ";   Empty = the Windows registry's setting (Direct3D if it has none)\n"
+    "renderer=\n"
+    "\n"
+    "; Folder the renderer DLLs are loaded from: a folder in the game folder, or a full\n"
+    "; path. A DLL that isn't there is loaded from the game folder. Empty = the game folder\n"
+    "driversFolder=\n"
+    "\n"
+    "; Direct3D: every vertex is moved half a pixel up and left, so 2D pictures (HUD,\n"
+    "; menus, text) land exactly on the pixels and come out sharp. 0 = as the renderer has it\n"
+    "alternatePixelCenter=1\n"
+    "\n"
+    "\n"
+    "[Widescreen]\n"
+    "\n"
+    "; Master switch for the widescreen features (the ws... settings): pick any\n"
+    "; resolution in the game's options\n"
     "widescreen=1\n"
-    "; menus are 640x480 pictures: 1 = shown 4:3 in the middle of the screen, 2 = stretched\n"
-    ";   to fill it, 0 = original (the display switches to 640x480 for the menus)\n"
-    "wsMenus=1\n"
-    "; resolution the menus run at: 1 = same as races (no mode switch), 2 = desktop resolution\n"
-    "wsMenuResolution=1\n"
-    "; 3D view: keep the 4:3 vertical view and show more at the sides (Hor+)\n"
+    "\n"
+    "; Race view: keep the 4:3 view's height and show more at the sides. 0 = the game\n"
+    "; stretches the 4:3 picture to the screen's width\n"
     "wsFixFOV=1\n"
-    "; race HUD: 1 = 4:3 proportions with side elements at the screen edges, 2 = 4:3 in the\n"
-    ";   middle, 0 = original (stretched sideways)\n"
-    "wsHud=1\n"
-    "; scale the intro/FMV movies like the menus\n"
-    "wsMovies=1\n"
-    "; list display modes that are not 4:3 in the options (the game hides them)\n"
+    "\n"
+    "; List the resolutions that aren't 4:3 in the options (the game hides them)\n"
     "wsUnlockResolutions=1\n"
+    "\n"
+    "; Race HUD:\n"
+    ";   1 = 4:3 proportions, with the side elements at the screen's edges\n"
+    ";   2 = 4:3 proportions in the middle\n"
+    ";   0 = stretched sideways\n"
+    "wsHud=1\n"
+    "\n"
+    "; Menus (they are 640x480 pictures):\n"
+    ";   1 = in 4:3 proportions in the middle of the screen\n"
+    ";   2 = stretched to the screen\n"
+    ";   0 = the game's own: the display switches to 640x480 for the menus\n"
+    "wsMenus=1\n"
+    "\n"
+    "; Which resolution the menus use with wsMenus on: 1 = the one chosen in the game's\n"
+    "; options (at startup, the one used last time), 2 = the desktop's\n"
+    "wsMenuResolution=1\n"
+    "\n"
+    "; Movies (intro, FMVs) are scaled like the menus\n"
+    "wsMovies=1\n"
+    "\n"
+    "; The race resolution last used, kept here by HSFrameFix (the game itself saves only\n"
+    "; the width). 0 = none yet\n"
+    "wsRaceWidth=0\n"
+    "wsRaceHeight=0\n"
+    "\n"
+    "\n"
+    "[Sound]\n"
+    "\n"
+    "; The game's own threads (main, sound, streaming) all run on one CPU core; its sound\n"
+    "; code was written for one CPU and crackles when they run side by side. The system's\n"
+    "; threads keep the other cores. 0 = leave them alone\n"
+    "gameThreadsOneCore=1\n"
+    "\n"
+    "; If the whole game was started on one core (taskset, a launcher's single-core\n"
+    "; option), the system's sound threads share that core and the sound pops whenever the\n"
+    "; game is busy. 1 = the game gets all cores back and only its own threads stay on one.\n"
+    "; The same is done if something pins the game later, such as a DirectDraw\n"
+    "; wrapper's single-core option. Needs gameThreadsOneCore=1\n"
+    "widenAffinity=1\n"
+    "\n"
+    "\n"
+    "[Fixes]\n"
+    "\n"
+    "; Closing the window (Alt+F4, the title bar, the window manager) ends the game.\n"
+    "; 0 = the game keeps running in the background\n"
+    "closeExits=1\n"
+    "\n"
+    "; No test for free disk space at startup. On today's big disks the game's test goes\n"
+    "; wrong and says \"Your hard drive has less than 1MB free space\". 0 = the game's test\n"
+    "noDiskSpaceCheck=1\n"
+    "\n"
+    "\n"
+    "[Portable]\n"
+    "\n"
+    "; The game needs no registry entries and can be copied or moved freely: where it's\n"
+    "; installed is answered from the folder its exe is in (without the entries the game\n"
+    "; stops with \"files are corrupted; please re-install\"). Music and movies are read\n"
+    "; from the game folder if Data\\Audio\\Music and Data\\Movies are there, else from the\n"
+    "; CD drive the registry names. 0 = the Windows registry as it is\n"
+    "portableInstall=1\n"
+    "\n"
+    "; Language, used when the registry has none: english, german, french, spanish,\n"
+    "; italian, swedish\n"
+    "language=english\n"
+    "\n"
+    "; Don't ask for the game CD at startup (the official 4.50 exe does, twice)\n"
+    "noCDCheck=1\n"
+    "\n"
+    "\n"
+    "[Advanced]\n"
+    "\n"
+    "; 1 = if the game's exe isn't one this mod was made for, the mod turns itself off.\n"
+    "; 0 = patch anyway (only for a modified exe you know is the same version; patching\n"
+    "; the wrong code can crash the game). Every difference is written to the log\n"
+    "exeCheck=1\n"
+    "\n"
+    "; Write HSFrameFix.log next to this file (what was patched, and frame statistics\n"
+    "; every logEverySeconds seconds). Send it along when reporting a problem\n"
+    "logToFile=1\n"
+    "logEverySeconds=10\n"
+    "\n"
+    "; Widescreen details in the log too\n"
     "wsLog=1\n";
 static char g_iniPath[MAX_PATH] = {};
+
+// The settings an existing file has (LoadConfig), and the ones it lacks: a file
+// from an older version keeps its layout, and each setting it doesn't have yet
+// is added at its end with the notes that stand above it in kIniText.
+static char g_iniSeen[96][32]; static int g_iniSeenN = 0;
+static bool IniHas(const char* key) {
+    for (int i = 0; i < g_iniSeenN; i++) if (!_stricmp(g_iniSeen[i], key)) return true;
+    return false;
+}
+static void IniSeen(const char* key) {
+    if (g_iniSeenN < 96 && !IniHas(key)) lstrcpynA(g_iniSeen[g_iniSeenN++], key, 32);
+}
+static void AppendMissingKeys(const char* path) {
+    FILE* a = nullptr;
+    const char* notes = nullptr, *notesEnd = nullptr;   // the notes above the settings of this paragraph
+    bool together = false;                        // the setting just above, under the same notes, was added
+    for (const char* p = kIniText; *p; ) {
+        const char* e = strchr(p, '\n');
+        const char* next = e ? e + 1 : p + strlen(p);
+        size_t len = (size_t)((e ? e : next) - p);
+        if (*p == ';') { if (!notes) notes = p; }
+        else if (!len || *p == '[') { notes = notesEnd = nullptr; together = false; }
+        else {
+            if (notes && !notesEnd) notesEnd = p;
+            char key[64] = {};
+            const char* eq = (const char*)memchr(p, '=', len);
+            if (eq && (size_t)(eq - p) < sizeof(key)) memcpy(key, p, (size_t)(eq - p));
+            if (key[0] && !IniHas(key)) {
+                if (!a) {
+                    a = fopen(path, "a");
+                    if (!a) return;
+                    fputs("\n\n; --- Settings this file didn't have yet, added by HSFrameFix v" HSFF_VERSION " ---\n", a);
+                }
+                if (!together) {
+                    fputs("\n", a);
+                    if (notes) fwrite(notes, 1, (size_t)(notesEnd - notes), a);
+                }
+                fwrite(p, 1, len, a); fputs("\n", a);
+                together = true;
+            } else together = false;
+        }
+        p = next;
+    }
+    if (a) fclose(a);
+}
 
 static void LoadConfig() {
     InitAsiDir();
@@ -304,42 +554,26 @@ static void LoadConfig() {
     if (!f) {
         f = fopen(path, "w");
         if (f) {
-            fputs("; HSFrameFix.ini (v" HSFF_VERSION ")\n"
-                  "; render at the display's refresh rate, blending car and camera motion\n"
-                  "; between the game's fixed 64 Hz simulation steps\n"
-                  "interpolate=1\n"
-                  "; also smooth the police helicopter's movement\n"
-                  "interpolateCopter=1\n"
-                  "; run the game's 128 Hz timer from a precise clock (needed for smooth blending)\n"
-                  "preciseTicks=1\n"
-                  "; frame limiter (0 = off, use vsync). Set to your refresh rate if you run without vsync\n"
-                  "targetFPS=0\n"
-                  "; don't blend jumps bigger than this per 1/64 s step (resets, teleports, camera cuts)\n"
-                  "maxStepDistance=10\n"
-                  "maxStepAngle=90\n"
-                  "; how many 1/64 s steps behind the newest simulation step frames are drawn\n"
-                  "; (1.0 = smooth with the least delay; raise to 1.5 if you still see hitches)\n"
-                  "interpDelay=1.0\n"
-                  "; menus: drop the game's 64 fps menu cap\n"
-                  "unlockMenus=1\n"
-                  "; menu frame limiter (-1 = same as targetFPS, 0 = off/vsync)\n"
-                  "menuTargetFPS=-1\n"
-                  "logToFile=1\n"
-                  "logEverySeconds=10\n", f);
-            fputs(kNewKeysBlock, f);
-            fputs(kGlideBlock, f);
-            fputs(kMenuMaxBlock, f);
-            fputs(kExeCheckBlock, f);
-            fputs(kWsBlock, f);
+            fputs(kIniText, f);
             fclose(f);
         }
         return;
     }
     char line[256];
-    bool sawNew = false, sawGlide = false, sawMenuMax = false, sawExeCheck = false, sawWs = false;
+    g_iniSeenN = 0;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
         char key[64] = {}, val[64] = {};
+        {   // driversFolder: a path - everything after the "=", spaces and all; may be empty
+            char dv[MAX_PATH] = {};
+            int got = sscanf(line, " %63[^= \t] = %259[^;\r\n]", key, dv);
+            if (got >= 1 && strchr(line, '=')) IniSeen(key);      // (a setting with nothing after the "=" counts too)
+            if (got >= 1 && !_stricmp(key, "driversFolder")) {
+                for (size_t n = strlen(dv); n && (dv[n - 1] == ' ' || dv[n - 1] == '\t'); ) dv[--n] = 0;
+                lstrcpynA(g_cfg.driversFolder, dv, sizeof(g_cfg.driversFolder));
+                continue;
+            }
+        }
         if (sscanf(line, " %63[^= \t] = %63s", key, val) < 2) continue;
         if      (!_stricmp(key, "interpolate"))       g_cfg.interpolate = atoi(val);
         else if (!_stricmp(key, "interpolateCopter")) g_cfg.interpolateCopter = atoi(val);
@@ -350,7 +584,7 @@ static void LoadConfig() {
         else if (!_stricmp(key, "interpDelay"))       g_cfg.interpDelay = (float)atof(val);
         else if (!_stricmp(key, "unlockMenus"))       g_cfg.unlockMenus = atoi(val);
         else if (!_stricmp(key, "menuTargetFPS"))     g_cfg.menuTargetFPS = atoi(val);
-        else if (!_stricmp(key, "speedUpLoading"))    { g_cfg.speedUpLoading = atoi(val); sawNew = true; }
+        else if (!_stricmp(key, "speedUpLoading"))    g_cfg.speedUpLoading = atoi(val);
         else if (!_stricmp(key, "loadScreenRenderMs")) g_cfg.loadScreenRenderMs = atoi(val);
         else if (!_stricmp(key, "fovOffset"))         g_cfg.fovOffset = atoi(val);
         else if (!_stricmp(key, "fovOffsetInCar"))    g_cfg.fovOffsetInCar = atoi(val);
@@ -362,12 +596,12 @@ static void LoadConfig() {
         else if (!_stricmp(key, "fovKeyDown"))        g_cfg.fovKeyDown = (int)strtol(val, nullptr, 0);
         else if (!_stricmp(key, "fovKeyReset"))       g_cfg.fovKeyReset = (int)strtol(val, nullptr, 0);
         else if (!_stricmp(key, "fovStep"))           g_cfg.fovStep = atoi(val);
-        else if (!_stricmp(key, "glideMenuEffects"))  { g_cfg.glideMenuEffects = atoi(val); sawGlide = true; }
-        else if (!_stricmp(key, "menuMaxFPS"))        { g_cfg.menuMaxFPS = atoi(val); sawMenuMax = true; }
-        else if (!_stricmp(key, "exeCheck"))          { g_cfg.exeCheck = atoi(val); sawExeCheck = true; }
+        else if (!_stricmp(key, "glideMenuEffects"))  g_cfg.glideMenuEffects = atoi(val);
+        else if (!_stricmp(key, "menuMaxFPS"))        g_cfg.menuMaxFPS = atoi(val);
+        else if (!_stricmp(key, "exeCheck"))          g_cfg.exeCheck = atoi(val);
         else if (!_stricmp(key, "logToFile"))         g_cfg.logToFile = atoi(val);
         else if (!_stricmp(key, "logEverySeconds"))   g_cfg.logEverySeconds = atoi(val);
-        else if (!_stricmp(key, "widescreen"))        { g_cfg.widescreen = atoi(val); sawWs = true; }
+        else if (!_stricmp(key, "widescreen"))        g_cfg.widescreen = atoi(val);
         else if (!_stricmp(key, "wsMenus"))           g_cfg.wsMenus = atoi(val);
         else if (!_stricmp(key, "wsMenuResolution"))  g_cfg.wsMenuResolution = atoi(val);
         else if (!_stricmp(key, "wsFixFOV"))          g_cfg.wsFixFOV = atoi(val);
@@ -376,30 +610,19 @@ static void LoadConfig() {
         else if (!_stricmp(key, "wsUnlockResolutions")) g_cfg.wsUnlockResolutions = atoi(val);
         else if (!_stricmp(key, "wsLog"))             g_cfg.wsLog = atoi(val);
         else if (!_stricmp(key, "closeExits"))        g_cfg.closeExits = atoi(val);
+        else if (!_stricmp(key, "noCDCheck"))         g_cfg.noCDCheck = atoi(val);
+        else if (!_stricmp(key, "noDiskSpaceCheck"))  g_cfg.noDiskSpaceCheck = atoi(val);
+        else if (!_stricmp(key, "portableInstall"))   g_cfg.portableInstall = atoi(val);
+        else if (!_stricmp(key, "alternatePixelCenter")) g_cfg.alternatePixelCenter = atoi(val);
+        else if (!_stricmp(key, "gameThreadsOneCore")) g_cfg.gameThreadsOneCore = atoi(val);
+        else if (!_stricmp(key, "widenAffinity"))     g_cfg.widenAffinity = atoi(val);
+        else if (!_stricmp(key, "language"))          lstrcpynA(g_cfg.language, val, sizeof(g_cfg.language));
+        else if (!_stricmp(key, "renderer"))          lstrcpynA(g_cfg.renderer, val, sizeof(g_cfg.renderer));
         else if (!_stricmp(key, "wsRaceWidth"))       g_cfg.wsRaceWidth = atoi(val);
         else if (!_stricmp(key, "wsRaceHeight"))      g_cfg.wsRaceHeight = atoi(val);
     }
     fclose(f);
-    if (!sawNew) {                        // ini from an older version: add the new keys
-        FILE* a = fopen(path, "a");
-        if (a) { fputs("\n", a); fputs(kNewKeysBlock, a); fclose(a); }
-    }
-    if (!sawGlide) {
-        FILE* a = fopen(path, "a");
-        if (a) { fputs("\n", a); fputs(kGlideBlock, a); fclose(a); }
-    }
-    if (!sawMenuMax) {
-        FILE* a = fopen(path, "a");
-        if (a) { fputs("\n", a); fputs(kMenuMaxBlock, a); fclose(a); }
-    }
-    if (!sawExeCheck) {
-        FILE* a = fopen(path, "a");
-        if (a) { fputs("\n", a); fputs(kExeCheckBlock, a); fclose(a); }
-    }
-    if (!sawWs) {
-        FILE* a = fopen(path, "a");
-        if (a) { fputs("\n", a); fputs(kWsBlock, a); fclose(a); }
-    }
+    AppendMissingKeys(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -494,8 +717,8 @@ static bool PatchPointer(void** slot, void* nv, void** ov) {
     return true;
 }
 template <typename Fn>
-static void ForEachImport(const char* dll, Fn cb) {
-    BYTE* base = (BYTE*)GetModuleHandleA(nullptr);
+static void ForEachImportIn(HMODULE mod, const char* dll, Fn cb) {
+    BYTE* base = (BYTE*)mod;
     auto dos = (PIMAGE_DOS_HEADER)base;
     auto nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
     DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
@@ -512,7 +735,30 @@ static void ForEachImport(const char* dll, Fn cb) {
         }
     }
 }
+template <typename Fn>
+static void ForEachImport(const char* dll, Fn cb) { ForEachImportIn(GetModuleHandleA(nullptr), dll, cb); }
+// This mod's own threads run on every core the process has, even if they're
+// created from a game thread pinned to one core (gameThreadsOneCore).
+static HANDLE g_modThreads[4]; static int g_modThreadN = 0;   // (DllMain only)
+static HANDLE StartModThread(LPTHREAD_START_ROUTINE fn) {
+    HANDLE h = CreateThread(nullptr, 0, fn, nullptr, CREATE_SUSPENDED, nullptr);
+    if (!h) return nullptr;
+    DWORD_PTR proc = 0, sys = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && proc) SetThreadAffinityMask(h, proc);
+    if (g_modThreadN < 4) g_modThreads[g_modThreadN++] = h;
+    ResumeThread(h);
+    return h;
+}
 template <typename T> static inline T Rd(DWORD a) { return *(volatile T*)a; }
+static char g_gameDir[MAX_PATH] = {};             // the folder the game's exe is in, with the closing backslash
+static bool InitGameDir() {
+    if (g_gameDir[0]) return true;
+    if (!GetModuleFileNameA(nullptr, g_gameDir, MAX_PATH)) g_gameDir[0] = 0;
+    char* sl = strrchr(g_gameDir, '\\');
+    if (!sl) { g_gameDir[0] = 0; return false; }
+    sl[1] = 0;
+    return true;
+}
 
 static bool g_knownExe = false;
 static bool CheckExe() {
@@ -550,7 +796,9 @@ static bool CheckExe() {
         bool vegCode = c[0] == 0xA1, vanCode = c[0] == 0x83 && c[1] == 0x3D;
         bool vegWs = w[0] == 0xE9, vanWs = w[0] == 0xD9 && w[1] == 0x1D;
         if (vanCode && vanWs) {
-            Logf("exe check: nfs4.exe matches (%d checks, official 4.50 patch)\n", total);
+            bool cd = Rd<BYTE>(0x4F7F24) == 0x75 || Rd<BYTE>(0x4F80C7) == 0xE8;
+            Logf("exe check: nfs4.exe matches (%d checks, official 4.50 patch%s)\n", total,
+                 cd ? "" : ", CD check removed");
             return true;
         }
         if (vegCode && vegWs) {
@@ -673,7 +921,7 @@ static void InstallTickScheduler() {
     });
     g_ticksActive = s && k && g_tickWake;
     if (g_ticksActive) {
-        g_tickThread = CreateThread(nullptr, 0, TickThread, nullptr, 0, nullptr);
+        g_tickThread = StartModThread(TickThread);
         if (!g_tickThread) g_ticksActive = false;        // no thread: every call goes to the game's timer
     }
     Logf("precise ticks: %s\n", g_ticksActive && g_tickThread ? "on" : "FAILED (game timer used)");
@@ -1352,9 +1600,11 @@ static void FovHotkeys() {
 }
 
 // Saves FOV changes to the ini and writes queued log lines, off the game thread.
+static void AffinityWatch();
 static DWORD WINAPI WriterThread(LPVOID) {
     for (;;) {
         WaitForSingleObject(g_qEvent, 1000);
+        AffinityWatch();
         DrainLogQueue();
         if (g_iniDirty) {
             Sleep(500);                          // let a burst of key presses settle
@@ -1558,8 +1808,17 @@ static int g_clip[4] = { 0, 0, 640, 480 };   // as the game set it
 static inline LONG XfX(float x) { return (LONG)lrintf(x * g_xsx + g_xox); }
 static inline LONG XfY(float y) { return (LONG)lrintf(y * g_xsy + g_xoy); }
 struct XV { float f[8]; };
+// alternatePixelCenter: Direct3D (as d3da.dll uses it) takes a pixel's centre to
+// be at whole coordinates, where the game's 2D pictures are laid out for pixels
+// that start there. So every vertex on its way to the Direct3D renderer is
+// moved half a pixel up and left; pictures drawn 1:1 then land texel on pixel.
+// (From HPFrameFix, where it was confirmed in game.)
+static bool g_apc = false;                        // on for the renderer loaded now
+static inline bool WrOn() { return g_xf || g_apc; }
 static inline void Xv(XV& d, const void* s) {
-    memcpy(&d, s, 32); d.f[0] = d.f[0] * g_xsx + g_xox; d.f[1] = d.f[1] * g_xsy + g_xoy;
+    memcpy(&d, s, 32);
+    if (g_xf) { d.f[0] = d.f[0] * g_xsx + g_xox; d.f[1] = d.f[1] * g_xsy + g_xoy; }
+    if (g_apc) { d.f[0] -= 0.5f; d.f[1] -= 0.5f; }
 }
 static XV* g_vbuf = nullptr; static int g_vbufN = 0;
 static XV* VBuf(int n) {
@@ -1569,21 +1828,21 @@ static XV* VBuf(int n) {
 static XV* XArr(const void* v, int n) {
     XV* b = VBuf(n); if (!b) return nullptr;
     for (int i = 0; i < n; i++) Xv(b[i], (const BYTE*)v + i * 32);
-    g_wsXfDraws++;
+    if (g_xf) g_wsXfDraws++;
     return b;
 }
-static void __stdcall WrPoint(void* a) { if (!g_xf) return g_tPoint(a); XV x; Xv(x, a); g_tPoint(&x); }
-static void __stdcall WrLine(void* a, void* b) { if (!g_xf) return g_tLine(a, b); XV x, y; Xv(x, a); Xv(y, b); g_tLine(&x, &y); }
+static void __stdcall WrPoint(void* a) { if (!WrOn()) return g_tPoint(a); XV x; Xv(x, a); g_tPoint(&x); }
+static void __stdcall WrLine(void* a, void* b) { if (!WrOn()) return g_tLine(a, b); XV x, y; Xv(x, a); Xv(y, b); g_tLine(&x, &y); }
 static void __stdcall WrTri(void* a, void* b, void* c) {
-    if (!g_xf) return g_tTri(a, b, c);
-    XV x, y, z; Xv(x, a); Xv(y, b); Xv(z, c); g_wsXfDraws++; g_tTri(&x, &y, &z);
+    if (!WrOn()) return g_tTri(a, b, c);
+    XV x, y, z; Xv(x, a); Xv(y, b); Xv(z, c); if (g_xf) g_wsXfDraws++; g_tTri(&x, &y, &z);
 }
 static void __stdcall WrQuad(void* a, void* b, void* c, void* d) {
-    if (!g_xf) return g_tQuad(a, b, c, d);
-    XV x, y, z, w; Xv(x, a); Xv(y, b); Xv(z, c); Xv(w, d); g_wsXfDraws++; g_tQuad(&x, &y, &z, &w);
+    if (!WrOn()) return g_tQuad(a, b, c, d);
+    XV x, y, z, w; Xv(x, a); Xv(y, b); Xv(z, c); Xv(w, d); if (g_xf) g_wsXfDraws++; g_tQuad(&x, &y, &z, &w);
 }
 static void StripCall(TStrip_t f, int n, void* v, int extra) {
-    if (!g_xf || n <= 0 || !v) return f(n, v);
+    if (!WrOn() || n <= 0 || !v) return f(n, v);
     XV* b = XArr(v, n + extra); if (!b) return f(n, v);
     f(n, b);
 }
@@ -1592,7 +1851,7 @@ static void __stdcall WrStrip(int n, void* v)  { StripCall(g_tStrip, n, v, 2); }
 static void __stdcall WrLStrip(int n, void* v) { StripCall(g_tLStrip, n, v, 1); }
 static void __stdcall WrPStrip(int n, void* v) { StripCall(g_tPStrip, n, v, 0); }
 static void MeshCall(TMesh_t f, int n, void* v, DWORD* idx, int per) {
-    if (!g_xf || n <= 0 || !v || !idx) return f(n, v, idx);
+    if (!WrOn() || n <= 0 || !v || !idx) return f(n, v, idx);
     DWORD mx = 0;
     for (int i = 0; i < n * per; i++) if (idx[i] > mx) mx = idx[i];
     if (mx > 65535) return f(n, v, idx);
@@ -1682,13 +1941,14 @@ static void __stdcall WrUnlock(int a) {
     g_lockInfo = nullptr;
     g_tUnlock(a);
 }
+static int g_feWantW = 0, g_feWantH = 0;          // the size the menus are meant to have (0: the game's 640x480)
 static int __stdcall WrSetMode(int idx, int a2, int bppCode) {
     int use = idx;
-    if (g_feCall && g_cfg.wsMenus && !g_softDriver && g_feTarget <= 0 && g_dispW) {
-        g_feTarget = FindMode(g_dispW, g_dispH);       // mode list may only be ready now
+    if (g_feCall && g_cfg.wsMenus && !g_softDriver && g_feTarget <= 0 && g_feWantW > 0) {
+        g_feTarget = FindMode(g_feWantW, g_feWantH);   // mode list may only be ready now
         if (g_cfg.wsLog) {
             BYTE* a = g_tAbout ? (BYTE*)g_tAbout() : nullptr;
-            Logf("widescreen: menu mode from the desktop: %d (%d modes listed)\n", g_feTarget,
+            Logf("widescreen: menu mode for %dx%d: %d (%d modes listed)\n", g_feWantW, g_feWantH, g_feTarget,
                  a && !IsBadReadPtr(a, 0x44) ? *(int*)(a + 0x3C) : -1);
         }
     }
@@ -1725,8 +1985,11 @@ static FARPROC WINAPI HkGetProcAddress(HMODULE m, LPCSTR name) {
         // blits, so scaled menus come apart: keep its menus in their own mode
         const char* b = strrchr(fn, '\\'); b = b ? b + 1 : fn;
         g_softDriver = !_strnicmp(b, "soft", 4);
-        Logf("widescreen: renderer driver %s%s\n", fn,
-             g_softDriver && g_cfg.wsMenus ? " (software renderer: menus stay 640x480)" : "");
+        g_apc = g_cfg.alternatePixelCenter && !_strnicmp(b, "d3d", 3);
+        Logf("renderer driver: %s%s\n", fn,
+             g_softDriver && g_cfg.widescreen && g_cfg.wsMenus ? " (software renderer: menus stay 640x480)" : "");
+        if (g_cfg.alternatePixelCenter)
+            Logf("pixel centre: %s\n", g_apc ? "every vertex moved by (-0.5, -0.5)" : "left as it is (Direct3D only)");
     }
     struct W { const char* n; void** real; void* wr; };
     static const W kW[] = {
@@ -1746,6 +2009,7 @@ static FARPROC WINAPI HkGetProcAddress(HMODULE m, LPCSTR name) {
     };
     for (const W& w : kW) if (!strcmp(name, w.n)) { *w.real = (void*)p; return (FARPROC)w.wr; }
     if (!strcmp(name, "_THRASH_clearwindow@0")) g_tClear = (TVoid_t)(void*)p;
+    if (!g_cfg.widescreen) return p;              // (hooked for alternatePixelCenter alone: the draw calls only)
     if (!strcmp(name, "_THRASH_setvideomode@12")) { g_tSetMode = (TSetMode_t)(void*)p; return (FARPROC)(void*)&WrSetMode; }
     if (!strcmp(name, "_THRASH_pageflip@0"))      { g_tFlip = (TVoid_t)(void*)p;      return (FARPROC)(void*)&WrFlip; }
     if (!strcmp(name, "_THRASH_lockwindow@0"))    { g_tLock = (TLock_t)(void*)p;      return (FARPROC)(void*)&WrLock; }
@@ -1760,14 +2024,22 @@ extern "C" void WsCallSelMode();
 extern "C" void __cdecl WsBeforeFeMode() {
     g_feCall = 1; g_feTarget = 0;
     if (!g_cfg.wsMenus || g_softDriver) return;
+    // wsMenuResolution=1: the resolution chosen in the game's options, whatever
+    // it is - 640x480 too, which is then simply the game's own menu mode. The
+    // first time (startup) the options aren't loaded yet and 640x480 comes
+    // back: then it's the size kept in the ini from last time (none yet: the
+    // game's 640x480). The desktop's size is only used when it's asked for (2).
+    static bool first = true;
     int t = 0, w = 0, h = 0;
-    if (g_cfg.wsMenuResolution != 2) {
+    if (g_cfg.wsMenuResolution == 2) { w = g_dispW; h = g_dispH; }
+    else {
         WsCallSelMode();
-        t = (int)g_wsSelResult;
-        // at startup the saved race mode isn't loaded yet (640x480 comes back)
-        if (!ModeEntry(t, &w, &h, nullptr) || w < 640 || h < 480 || (w == 640 && h == 480)) t = 0;
+        if (!ModeEntry((int)g_wsSelResult, &w, &h, nullptr)) { w = 0; h = 0; }
+        if (first && w <= 640 && h <= 480) { w = g_cfg.wsRaceWidth; h = g_cfg.wsRaceHeight; }
     }
-    if (!t && g_dispW) t = FindMode(g_dispW, g_dispH);
+    first = false;
+    if (w > 640 || h > 480) { g_feWantW = w; g_feWantH = h; t = FindMode(w, h); }
+    else g_feWantW = g_feWantH = 0;
     g_feTarget = t;
     // the game skips the switch when it thinks mode 1 is already set
     if (t > 0 && t != g_curRealIdx) *(int*)ws::pCurMode = -1;
@@ -1988,6 +2260,422 @@ static void WINAPI HkPostQuitMessage(int code) {
     }
     g_oPostQuit(code);
 }
+// The official exe's two startup CD checks get the bytes the CD-less exe has
+// there, if they still hold the original's (VEG's exe and the CD-less one
+// don't: nothing to do).
+// ---------------------------------------------------------------------------
+// Portable install: the registry values the game finds itself by (see the
+// header) are answered here. RegOpenKeyExA / RegQueryValueExA / RegCloseKey as
+// the game imports them are wrapped; the three keys are recognised when
+// they're opened (a key that isn't in the registry gets a handle of our own),
+// and their values are answered like this:
+//  - App Paths\NfsHs.exe "Path": the folder the exe is in.
+//  - 1.0 "instLev": 2 if every folder a full install has is in the game
+//    folder, 1 if all but Data\Showcase are; otherwise the registry's (2 if
+//    it has none).
+//  - 1.0 "SrcDrive": the game folder if Data\Audio\Music and Data\Movies are
+//    in it, or if the registry has none; otherwise the registry's (the CD).
+//  - 1.0 "Language": the registry's; if it has none, language= from the ini.
+//  - 1.0 "Variant": the registry's; if it has none, 0.
+//  - "Thrash Driver": renderer= from the ini if set (as its DLL's name), else
+//    the registry's, else d3da.dll. "D3D Device": the registry's, else 0. "3D Device Description":
+//    the registry's, else a neutral name.
+// Every other key and value goes to the registry untouched.
+// ---------------------------------------------------------------------------
+typedef LONG (WINAPI *RegOpen_t)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY);
+typedef LONG (WINAPI *RegQuery_t)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+typedef LONG (WINAPI *RegClose_t)(HKEY);
+static RegOpen_t g_oRegOpen = nullptr; static RegQuery_t g_oRegQuery = nullptr; static RegClose_t g_oRegClose = nullptr;
+enum { kRkAppPath = 1, kRkGame10, kRkGame };
+static struct { HKEY h; int kind; bool fake; } g_rk[8];   // the keys of ours the game has open (game threads only)
+static bool GameDirHas(const char* sub) {
+    char p[MAX_PATH];
+    if (snprintf(p, sizeof(p), "%s%s", g_gameDir, sub) >= (int)sizeof(p)) return false;
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+static void PortableLogOnce(int id, const char* fmt, const char* a) {
+    static unsigned done = 0;
+    if (done & (1u << id)) return;
+    done |= 1u << id;
+    Logf(fmt, a);
+}
+static LONG RegAnswer(DWORD type, const void* v, DWORD len, LPDWORD outType, LPBYTE data, LPDWORD cb) {
+    if (outType) *outType = type;
+    if (!cb) return data ? ERROR_INVALID_PARAMETER : ERROR_SUCCESS;
+    DWORD room = *cb; *cb = len;
+    if (!data) return ERROR_SUCCESS;
+    if (room < len) return ERROR_MORE_DATA;
+    memcpy(data, v, len);
+    return ERROR_SUCCESS;
+}
+static LONG RegAnswerSz(const char* s, LPDWORD t, LPBYTE d, LPDWORD cb) { return RegAnswer(REG_SZ, s, (DWORD)strlen(s) + 1, t, d, cb); }
+static LONG RegAnswerDw(DWORD v, LPDWORD t, LPBYTE d, LPDWORD cb) { return RegAnswer(REG_DWORD, &v, 4, t, d, cb); }
+static LONG WINAPI HkRegOpenKeyExA(HKEY root, LPCSTR sub, DWORD opt, REGSAM sam, PHKEY out) {
+    LONG r = g_oRegOpen(root, sub, opt, sam, out);
+    int kind = 0;
+    if (root == HKEY_LOCAL_MACHINE && sub && out) {
+        if (!_stricmp(sub, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\NfsHs.exe")) kind = kRkAppPath;
+        else if (!_stricmp(sub, "SOFTWARE\\Electronic Arts\\Need For Speed High Stakes\\1.0")) kind = kRkGame10;
+        else if (!_stricmp(sub, "SOFTWARE\\Electronic Arts\\Need For Speed High Stakes")) kind = kRkGame;
+    }
+    if (!kind) return r;
+    for (int i = 0; i < 8; i++) {
+        if (g_rk[i].h) continue;
+        bool fake = r != ERROR_SUCCESS;
+        if (fake) *out = (HKEY)(ULONG_PTR)(0x7EED0100 + i * 4);    // (not in the registry: a handle of our own)
+        g_rk[i].h = *out; g_rk[i].kind = kind; g_rk[i].fake = fake;
+        return ERROR_SUCCESS;
+    }
+    return r;                                     // (no slot free: as the registry has it)
+}
+static LONG WINAPI HkRegCloseKey(HKEY h) {
+    for (int i = 0; i < 8; i++)
+        if (g_rk[i].h == h && h) {
+            bool fake = g_rk[i].fake;
+            g_rk[i].h = nullptr;
+            return fake ? ERROR_SUCCESS : g_oRegClose(h);
+        }
+    return g_oRegClose(h);
+}
+static LONG WINAPI HkRegQueryValueExA(HKEY h, LPCSTR name, LPDWORD res, LPDWORD type, LPBYTE data, LPDWORD cb) {
+    int kind = 0; bool fake = false;
+    for (int i = 0; i < 8; i++) if (g_rk[i].h == h && h) { kind = g_rk[i].kind; fake = g_rk[i].fake; }
+    if (!kind || !name) return g_oRegQuery(h, name, res, type, data, cb);
+    // what the registry itself says (kept in the caller's buffer when it's used as it is)
+    DWORD cbIn = cb ? *cb : 0;
+    LONG real = fake ? ERROR_FILE_NOT_FOUND : g_oRegQuery(h, name, res, type, data, cb);
+    bool have = real == ERROR_SUCCESS;
+    if (!have && cb) *cb = cbIn;
+    if (kind == kRkAppPath && !_stricmp(name, "Path")) {
+        char dir[MAX_PATH]; lstrcpynA(dir, g_gameDir, sizeof(dir));
+        size_t n = strlen(dir);
+        if (n > 3 && dir[n - 1] == '\\') dir[n - 1] = 0;          // (as the installer writes it: no closing backslash)
+        PortableLogOnce(0, "portable install: install folder = %s\n", dir);
+        if (cb) *cb = cbIn;
+        return RegAnswerSz(dir, type, data, cb);
+    }
+    if (kind == kRkGame10 && !_stricmp(name, "instLev")) {
+        static const char* const kLev1[] = { "Data\\Tracks", "Data\\Cars", "Data\\Audio\\SFX", "Data\\Audio\\Speech",
+                                             "Data\\FeArt", "Data\\FeArt\\Track", "Data\\FeArt\\VidWall" };
+        bool all1 = true;
+        for (const char* f : kLev1) all1 = all1 && GameDirHas(f);
+        int lev = all1 ? (GameDirHas("Data\\Showcase") ? 2 : 1) : -1;
+        if (lev < 0 && have) { PortableLogOnce(1, "portable install: not every data folder is in the game folder - install level %s\n", "as the registry has it"); return real; }
+        if (lev < 0) lev = 2;
+        PortableLogOnce(1, "portable install: install level %s\n", lev == 2 ? "2 (everything in the game folder)" : "1 (no Data\\Showcase in the game folder)");
+        if (cb) *cb = cbIn;
+        return RegAnswerDw((DWORD)lev, type, data, cb);
+    }
+    if (kind == kRkGame10 && !_stricmp(name, "SrcDrive")) {
+        bool local = GameDirHas("Data\\Audio\\Music") && GameDirHas("Data\\Movies");
+        if (!local && have) { PortableLogOnce(2, "portable install: music and movies %s\n", "from the CD drive the registry names (not both in the game folder)"); return real; }
+        PortableLogOnce(2, "portable install: music and movies %s\n", local ? "from the game folder" : "expected in the game folder (not there, and the registry names no CD drive)");
+        if (cb) *cb = cbIn;
+        return RegAnswerSz(g_gameDir, type, data, cb);
+    }
+    if (kind == kRkGame10 && !_stricmp(name, "Language") && !have) {
+        static const struct { const char* n; DWORD code; } kLang[] = {
+            { "english", 1 }, { "french", 2 }, { "german", 3 }, { "italian", 4 }, { "spanish", 5 }, { "swedish", 6 } };
+        DWORD code = 1;
+        for (const auto& l : kLang) if (!_stricmp(g_cfg.language, l.n)) code = l.code;
+        PortableLogOnce(3, "portable install: no language in the registry - %s\n", g_cfg.language);
+        return RegAnswerDw(code, type, data, cb);
+    }
+    // "Variant" (0x5047A0; without it the game aborts: AMF=20 platform.c(604)): the
+    // edition, 0 to 7. 0 is the American one (US English; Spanish prices in pesos),
+    // 1 with English gives the British texts, 4, 5 and 6 set special flags.
+    if (kind == kRkGame10 && !_stricmp(name, "Variant") && !have) {
+        PortableLogOnce(6, "portable install: no edition (Variant) in the registry - %s\n", "0, the American one");
+        return RegAnswerDw(0, type, data, cb);
+    }
+    if (kind == kRkGame && !_stricmp(name, "Thrash Driver")) {
+        static const struct { const char* n; const char* v; } kRend[] = {
+            { "d3d", "d3da.dll" }, { "software", "softtria.dll" }, { "voodoo", "voodoo2a.dll" }, { "voodoo2", "voodoo2a.dll" } };
+        const char* v = nullptr;
+        for (const auto& m : kRend) if (!_stricmp(g_cfg.renderer, m.n)) v = m.v;
+        if (g_cfg.renderer[0] && !v) PortableLogOnce(4, "renderer: \"%s\" isn't d3d, software, voodoo or voodoo2 - ignored\n", g_cfg.renderer);
+        if (!v && have) return real;
+        if (!v) v = "d3da.dll";
+        PortableLogOnce(5, "renderer: %s\n", v);
+        if (cb) *cb = cbIn;
+        return RegAnswerSz(v, type, data, cb);
+    }
+    if (kind == kRkGame && !_stricmp(name, "D3D Device") && !have) return RegAnswerDw(0, type, data, cb);
+    // (0x504D50, read just before the renderer; missing = "files are corrupted". A card's
+    // name, of which the game only knows a few old ones to work around)
+    if (kind == kRkGame && !_stricmp(name, "3D Device Description") && !have) return RegAnswerSz("Primary Display Driver", type, data, cb);
+    if (!have) {                                  // (a value of the game's keys nobody answers: worth knowing about)
+        static int n = 0;
+        if (n++ < 16) Logf("portable install: the game asked for \"%s\" (key %d), which isn't in the registry and isn't answered here\n", name, kind);
+    }
+    return real;
+}
+static void InstallPortable() {
+    if (!g_knownExe) return;
+    if (!g_cfg.portableInstall) { Logf("portable install: off (the registry as it is)\n"); return; }
+    if (!InitGameDir()) { Logf("portable install: the game's folder isn't known - off\n"); return; }
+    bool o = false, q = false, c = false;
+    ForEachImport("ADVAPI32.dll", [&](void** slot, const char* nm) {
+        if (!strcmp(nm, "RegOpenKeyExA")) o = PatchPointer(slot, (void*)&HkRegOpenKeyExA, (void**)&g_oRegOpen);
+        else if (!strcmp(nm, "RegQueryValueExA")) q = PatchPointer(slot, (void*)&HkRegQueryValueExA, (void**)&g_oRegQuery);
+        else if (!strcmp(nm, "RegCloseKey")) c = PatchPointer(slot, (void*)&HkRegCloseKey, (void**)&g_oRegClose);
+    });
+    Logf("portable install: %s\n", o && q && c ? "on" : "imports not found - off");
+}
+
+// ---------------------------------------------------------------------------
+// Game threads on one core (from HPFrameFix; as SilentPatch's
+// SingleProcAffinity for NFS3): the main thread and every thread the game or
+// its sound driver eacsnd.dll creates run on one core; threads of Windows/Wine
+// and of this mod keep all cores. The game's sound code shares data between
+// its threads with no locking that holds up on several cores: it crackles and
+// pops. Pinning the whole process instead would also put DirectSound's mixer
+// on that core.
+// ---------------------------------------------------------------------------
+typedef HANDLE (WINAPI *CreateThread_t)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+static CreateThread_t g_oCreateThread = nullptr;
+static volatile DWORD_PTR g_gameCore = 0;
+// The game's threads, kept so they can be put back on their core (AffinityWatch)
+static CRITICAL_SECTION g_gtLock; static bool g_gtLockInit = false;
+static HANDLE g_gameThreads[64]; static int g_gameThreadN = 0;
+static void NoteGameThread(HANDLE h) {
+    HANDLE d = nullptr;
+    if (!g_gtLockInit || !DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, 0, FALSE, DUPLICATE_SAME_ACCESS)) return;
+    EnterCriticalSection(&g_gtLock);
+    for (int i = 0; i < g_gameThreadN; )          // (threads that have ended make room)
+        if (WaitForSingleObject(g_gameThreads[i], 0) == WAIT_OBJECT_0) { CloseHandle(g_gameThreads[i]); g_gameThreads[i] = g_gameThreads[--g_gameThreadN]; }
+        else i++;
+    if (g_gameThreadN < 64) g_gameThreads[g_gameThreadN++] = d; else CloseHandle(d);
+    LeaveCriticalSection(&g_gtLock);
+}
+static HANDLE WINAPI HkCreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID arg,
+                                    DWORD flags, LPDWORD id) {
+    HANDLE h = g_oCreateThread(sa, stack, fn, arg, flags | CREATE_SUSPENDED, id);
+    if (h) {
+        // (under the lock: AffinityWatch either sees this thread in the list or has finished before it's pinned)
+        if (g_gtLockInit) EnterCriticalSection(&g_gtLock);
+        SetThreadAffinityMask(h, g_gameCore);
+        NoteGameThread(h);
+        if (g_gtLockInit) LeaveCriticalSection(&g_gtLock);
+        if (!(flags & CREATE_SUSPENDED)) ResumeThread(h);
+    }
+    return h;
+}
+// Something else can pin the whole process to one core after this mod has
+// loaded - a DirectDraw or Direct3D wrapper's "single core" option does that
+// when the game starts its renderer. That puts the system's sound threads and
+// this mod's own on the game's core after all, and leaves the game's threads
+// with a core of ours that the process no longer has. Looked at once a second
+// (the log writer's thread): if the process has come down to one core, it gets
+// all of them back (widenAffinity), the game's threads go to the core the
+// other one picked, and this mod's threads get every core again.
+static void AffinityWatch() {
+    if (!g_gameCore || !g_cfg.widenAffinity || !g_gtLockInit) return;
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) return;
+    if ((proc & (proc - 1)) || !(sys & (sys - 1))) return;        // (not pinned, or there is only one core)
+    static int times = 0;
+    EnterCriticalSection(&g_gtLock);              // (no game thread is created and pinned half way through this)
+    if (!SetProcessAffinityMask(GetCurrentProcess(), sys)) {
+        LeaveCriticalSection(&g_gtLock);
+        if (times++ < 3) Logf("threads: the process was pinned to one core (mask %lX) after the mod loaded - couldn't be widened\n", (unsigned long)proc);
+        return;
+    }
+    g_gameCore = proc;
+    int n = 0;
+    for (int i = 0; i < g_gameThreadN; i++) if (SetThreadAffinityMask(g_gameThreads[i], proc)) n++;
+    LeaveCriticalSection(&g_gtLock);
+    for (int i = 0; i < g_modThreadN; i++) SetThreadAffinityMask(g_modThreads[i], sys);
+    if (times++ < 8) Logf("threads: something pinned the whole process to one core (mask %lX) after the mod loaded - "
+                          "all cores given back, the game's %d thread(s) kept on that core\n", (unsigned long)proc, n);
+}
+static bool HookCreateThreadIn(HMODULE mod, const char* what) {
+    bool hooked = false;
+    ForEachImportIn(mod, "KERNEL32.dll", [&](void** s, const char* nm) {
+        if (strcmp(nm, "CreateThread")) return;
+        void* old = nullptr;
+        if (*s != (void*)&HkCreateThread && PatchPointer(s, (void*)&HkCreateThread, &old)) {
+            if (!g_oCreateThread) g_oCreateThread = (CreateThread_t)old;
+            hooked = true;
+        }
+    });
+    if (!hooked) Logf("threads: %s - CreateThread import not found\n", what);
+    return hooked;
+}
+// LoadLibraryA as the game imports it. Two things hang on it:
+//  - eacsnd.dll, the sound driver, is loaded that way: its threads are the
+//    game's too (gameThreadsOneCore);
+//  - driversFolder (from HPFrameFix): the renderer DLL, which the game loads by
+//    its bare name (0x5040D2), is taken from that folder if it's there, else
+//    from the game folder as before. While it loads, that folder is also where
+//    its own dependencies (glide2x.dll...) are looked for after the game folder.
+typedef HMODULE (WINAPI *LoadLibraryA_t)(LPCSTR);
+static LoadLibraryA_t g_oLoadLibraryA = nullptr;
+static char g_driversDir[MAX_PATH] = {};          // with the closing backslash; empty = game folder
+static bool g_driversExist = false;
+static HMODULE WINAPI HkLoadLibraryA(LPCSTR name) {
+    static const char* const kRendererDlls[] = { "d3da.dll", "softtria.dll", "voodoo2a.dll" };
+    bool renderer = false;
+    if (name) for (const char* d : kRendererDlls) renderer = renderer || !_stricmp(name, d);
+    if (renderer && g_driversDir[0]) {
+        static char seen[4][16]; static int nSeen = 0;            // log each DLL once
+        bool first = true;
+        for (int i = 0; i < nSeen; i++) if (!_stricmp(seen[i], name)) first = false;
+        if (first && nSeen < 4) lstrcpynA(seen[nSeen++], name, 16);
+        char path[MAX_PATH];
+        if (snprintf(path, sizeof(path), "%s%s", g_driversDir, name) < (int)sizeof(path) &&
+            GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+            char prev[MAX_PATH]; DWORD pl = GetDllDirectoryA(sizeof(prev), prev);
+            SetDllDirectoryA(g_driversDir);
+            HMODULE h = g_oLoadLibraryA(path);
+            DWORD err = h ? 0 : GetLastError();
+            SetDllDirectoryA(pl && pl < sizeof(prev) ? prev : nullptr);
+            if (first) Logf("drivers: %s %s (error %lu)\n", path, h ? "loaded" : "FAILED", (unsigned long)err);
+            if (h) return h;
+        } else if (first && g_driversExist) {
+            Logf("drivers: %s not in %s - game folder\n", name, g_driversDir);
+        }
+    }
+    HMODULE h = g_oLoadLibraryA(name);
+    if (h && name && g_gameCore) {
+        const char* b = name;
+        for (const char* c = name; *c; c++) if (*c == '\\' || *c == '/' || *c == ':') b = c + 1;
+        if (!_stricmp(b, "eacsnd.dll") || !_stricmp(b, "eacsnd")) {
+            static HMODULE hooked = nullptr;
+            if (h != hooked && HookCreateThreadIn(h, "eacsnd.dll")) { hooked = h; Logf("threads: eacsnd.dll's threads too\n"); }
+        }
+    }
+    return h;
+}
+static bool HookLoadLibrary() {                   // once, for whichever of the two wants it
+    static int state = -1;
+    if (state < 0) {
+        void** slot = nullptr;
+        ForEachImport("KERNEL32.dll", [&](void** sl, const char* nm) { if (!strcmp(nm, "LoadLibraryA")) slot = sl; });
+        state = slot && PatchPointer(slot, (void*)&HkLoadLibraryA, (void**)&g_oLoadLibraryA) ? 1 : 0;
+    }
+    return state == 1;
+}
+static void InstallDriversFolder() {
+    if (!g_knownExe) return;
+    const char* f = g_cfg.driversFolder;
+    if (!f[0]) { Logf("drivers: game folder\n"); return; }
+    bool absolute = strchr(f, ':') || (f[0] == '\\' && f[1] == '\\');
+    if (!absolute && !InitGameDir()) { Logf("drivers: the game's folder isn't known - game folder\n"); return; }
+    int n = snprintf(g_driversDir, sizeof(g_driversDir), "%s%s", absolute ? "" : g_gameDir, f);
+    if (n <= 0 || n >= (int)sizeof(g_driversDir) - 1) { Logf("drivers: path too long - game folder\n"); g_driversDir[0] = 0; return; }
+    while (n && (g_driversDir[n - 1] == '\\' || g_driversDir[n - 1] == '/')) g_driversDir[--n] = 0;
+    g_driversDir[n++] = '\\'; g_driversDir[n] = 0;
+    if (!HookLoadLibrary()) { g_driversDir[0] = 0; Logf("drivers: LoadLibraryA import not found - game folder\n"); return; }
+    DWORD a = GetFileAttributesA(g_driversDir);
+    g_driversExist = a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    Logf("drivers: %s%s\n", g_driversDir, g_driversExist ? "" : " (not there - game folder)");
+}
+static void InstallGameThreadsOneCore() {
+    if (!g_knownExe || !g_cfg.gameThreadsOneCore) { Logf("threads: all cores\n"); return; }
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) { Logf("threads: affinity unknown - all cores\n"); return; }
+    // A process that's already on one core has the system's threads on that core
+    // too - under Wine that's DirectSound's mixer and the audio driver's threads,
+    // which then wait behind the game thread whenever it's busy, and the sound
+    // pops. It gets all the system's cores back, and from here on it's the usual
+    // arrangement: the game's own threads on the core it was on, the rest free.
+    DWORD_PTR was = proc;
+    if (!(proc & (proc - 1))) {
+        if (!g_cfg.widenAffinity || !(sys & (sys - 1)) || !SetProcessAffinityMask(GetCurrentProcess(), sys)) {
+            Logf("threads: the game already has one core (process mask %lX, system mask %lX)%s\n", (unsigned long)proc, (unsigned long)sys,
+                 !g_cfg.widenAffinity ? "" : (sys & (sys - 1)) ? " - couldn't be widened" : " - the system shows only one");
+            return;
+        }
+        Logf("threads: the process was on one core (mask %lX) - given all of them (mask %lX)\n", (unsigned long)proc, (unsigned long)sys);
+        proc = sys;
+    }
+    g_gameCore = (was & (was - 1)) ? proc & (~proc + 1) : was;   // (the core it was pinned to, if it was)
+    InitializeCriticalSection(&g_gtLock); g_gtLockInit = true;   // (before the hook: HkCreateThread uses it)
+    if (!HookCreateThreadIn(GetModuleHandleA(nullptr), "the game")) {
+        if (was != proc) SetProcessAffinityMask(GetCurrentProcess(), was);   // (can't pin the game's threads: as it was)
+        g_gameCore = 0; return;
+    }
+    bool ll = HookLoadLibrary();
+    SetThreadAffinityMask(GetCurrentThread(), g_gameCore);      // DllMain runs on the game's main thread
+    NoteGameThread(GetCurrentThread());
+    int core = 0; while (!((g_gameCore >> core) & 1)) core++;
+    Logf("threads: the game's threads on core %d, the rest on all cores%s\n", core,
+         ll ? "" : " (LoadLibraryA import not found: eacsnd.dll's threads stay free)");
+}
+
+// The game has one box for everything that goes wrong while it starts: "Need
+// For Speed files are corrupted; please re-install", with a number in its title
+// ("Warning #3") that says what failed (0x504530: eax = language, edx = the
+// number). The log gets the number, where the box was asked for, and what the
+// game's code shows that number to mean there.
+extern "C" void __cdecl StartupErrorNote(DWORD code, DWORD ret) {
+    const char* what = "?";
+    switch (ret) {
+        case 0x4F7E81: case 0x4F7EC1: what = "the game's version text couldn't be read"; break;
+        case 0x4F80B5: what = "the install folder, level or CD drive couldn't be read (registry / portableInstall)"; break;
+        case 0x4F80DF: what = "a data file the game opens first wasn't found (0x450590)"; break;
+        case 0x503F85: what = "no \"3D Device Description\" (registry)"; break;
+        case 0x503F9B: what = "no \"Thrash Driver\" or \"D3D Device\" (registry / renderer=)"; break;
+        case 0x503FEE: what = "\"Thrash Driver\" isn't softtria.dll, voodoo2a.dll or d3da.dll (or the start of one)"; break;
+        case 0x504519: what = "the renderer DLL couldn't be loaded or started"; break;
+        case 0x504A4E: case 0x504A66: what = "a later startup step failed"; break;
+    }
+    Logf("startup: the game's \"files are corrupted\" box, Warning #%lu, asked for at 0x%06lX: %s\n",
+         (unsigned long)code, (unsigned long)ret - 5, what);
+}
+extern "C" void StartupErrorStub();
+asm(".text\n"
+    ".globl _StartupErrorStub\n"
+    "_StartupErrorStub:\n"            // jmp from 0x504530; [esp] = the caller's return address
+    "    pushal\n"
+    "    pushl 32(%esp)\n"
+    "    pushl %edx\n"
+    "    call _StartupErrorNote\n"
+    "    addl $8, %esp\n"
+    "    popal\n"
+    "    pushl %ecx\n"                // the six bytes the jmp replaced
+    "    pushl %esi\n"
+    "    pushl %edi\n"
+    "    pushl %ebp\n"
+    "    movl %esp, %ebp\n"
+    "    pushl $0x504536\n"
+    "    ret\n"
+);
+static void InstallStartupFixes() {
+    if (!g_knownExe) return;
+    {
+        BYTE j[6] = { 0xE9, 0, 0, 0, 0, 0x90 };
+        DWORD rel = (DWORD)&StartupErrorStub - (0x504530 + 5); memcpy(j + 1, &rel, 4);
+        if (!PatchBytes(0x504530, j, 6)) Logf("startup: error box logging - patch FAILED\n");
+    }
+    // [0x825814] is set at 0x4F7E58, just ahead of the argument reader and the CD checks
+    if (Rd<DWORD>(0x825814)) Logf("startup: the game had already begun starting when the mod was loaded - "
+                                  "the startup fixes below may come too late (the ASI loader decides)\n");
+    static const BYTE je[6] = { 0x0F, 0x84, 0xF2, 0x00, 0x00, 0x00 };                // 0x4F833A: je 0x4F8432
+    static const BYTE jeOk[6] = { 0x0F, 0x84, 0x71, 0x02, 0x00, 0x00 };              //           je 0x4F85B1
+    if (!IsBadReadPtr((void*)0x4F833A, 6) && !memcmp((void*)0x4F833A, je, 6))
+        Logf("startup arguments: %s\n", PatchBytes(0x4F833A, jeOk, 6) ? "\"Invalid argument\" with no arguments fixed" : "patch FAILED");
+}
+static void InstallNoCD() {
+    if (!g_knownExe) return;
+    static const BYTE jne[2] = { 0x75, 0x22 }, jmp[2] = { 0xEB, 0x7F };              // 0x4F7F24: jne 0x4F7F48 -> jmp 0x4F7FA5
+    static const BYTE call[5] = { 0xE8, 0xA4, 0xCA, 0x00, 0x00 }, nops[5] = { 0x90, 0x90, 0x90, 0x90, 0x90 };   // 0x4F80C7: call 0x504B70
+    bool has1 = !IsBadReadPtr((void*)0x4F7F24, 2) && !memcmp((void*)0x4F7F24, jne, 2);
+    bool has2 = !IsBadReadPtr((void*)0x4F80C7, 5) && !memcmp((void*)0x4F80C7, call, 5);
+    if (!has1 && !has2) { Logf("CD check: none in this exe\n"); return; }
+    if (!g_cfg.noCDCheck) { Logf("CD check: on (the game's)\n"); return; }
+    bool ok = (!has1 || PatchBytes(0x4F7F24, jmp, 2)) && (!has2 || PatchBytes(0x4F80C7, nops, 5));
+    Logf("CD check: %s\n", ok ? "off" : "patch FAILED");
+}
+static void InstallDiskSpaceFix() {
+    if (!g_knownExe) return;
+    if (!g_cfg.noDiskSpaceCheck) { Logf("disk space check: on (the game's)\n"); return; }
+    static const BYTE yes[6] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };               // mov eax, 1 / ret
+    Logf("disk space check: %s\n", PatchBytes(0x49E800, yes, 6) ? "off" : "patch FAILED");
+}
+
 static void InstallCloseFix() {
     if (!g_knownExe || !g_cfg.closeExits) return;
     bool q = false, d = false;
@@ -2001,6 +2689,12 @@ static void InstallCloseFix() {
 
 static void InstallWidescreen() {
     g_dispW = GetSystemMetrics(SM_CXSCREEN); g_dispH = GetSystemMetrics(SM_CYSCREEN);
+    if (g_knownExe && !g_cfg.widescreen && g_cfg.alternatePixelCenter) {   // (the draw wrappers alone)
+        ForEachImport("KERNEL32.dll", [&](void** slot, const char* nm) {
+            if (!strcmp(nm, "GetProcAddress")) PatchPointer(slot, (void*)&HkGetProcAddress, (void**)&g_oGPA);
+        });
+        if (!g_oGPA) Logf("pixel centre: GetProcAddress import not found - off\n");
+    }
     if (!g_knownExe || !g_cfg.widescreen) { Logf("widescreen: off\n"); return; }
     // VEG's exe has its own widescreen patch: put its sites back first
     if (*(BYTE*)0x53A086 == 0xE9) {
@@ -2096,6 +2790,12 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
         LoadConfig();
         OpenLog();
         g_knownExe = CheckExe();
+        InstallStartupFixes();                    // (first: these run right at the game's start)
+        InstallGameThreadsOneCore();
+        InstallDriversFolder();
+        InstallNoCD();
+        InstallPortable();
+        InstallDiskSpaceFix();
         timeBeginPeriod(1);
         InstallTickScheduler();
         InstallInterpolation();
@@ -2106,8 +2806,8 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
         InstallGlideMenuEffects();
         InstallWidescreen();
         InstallCloseFix();
-        if (g_qEvent) CreateThread(nullptr, 0, WriterThread, nullptr, 0, nullptr);
-        if (g_log) CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr);
+        if (g_qEvent) StartModThread(WriterThread);
+        if (g_log) StartModThread(StatsThread);
     } else if (reason == DLL_PROCESS_DETACH) {
         if (reserved) g_logLockInit = false;
         if (g_log) { Logf("=== shutdown ===\n"); fclose(g_log); g_log = nullptr; }
