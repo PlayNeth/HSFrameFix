@@ -18,6 +18,25 @@ Tested renderers:
 
 ---
 
+## 0.8.1: lit nights on the Need for Speed III tracks, a resolution list that holds, 4:3 loading screen
+
+- **Lit nights on the nine tracks from Need for Speed III** (`nightLamps`, `nightLampReach`, `nightScenery`; `[Graphics]` section). Hometown, Redrock Ridge, Atlantica, Rocky Pass, Country Woods, Lost Canyons, Aquatica, Summit and Empire City were pitch black at night outside the headlights: the game darkens them to a few percent of their daytime colours, and their lamps are only drawn as glows that light nothing. Light is now added to the track as it loads, the way HPFrameFix does it for the same tracks:
+  - every steady lamp lights the road and what's around it, in its glow's colour;
+  - the buildings' windows, lit signs, tunnel lights, lamp posts and the power poles' lamps give light too;
+  - Atlantica and Aquatica, with few lamps of their own, get street lighting over the road and a lit city's glow;
+  - moving things with lights of their own are lit: Atlantica's boat, Aquatica's ships, Country Woods' doughnut, Summit's cable cars, the turning Gas Stop signs of Redrock Ridge and Lost Canyons;
+  - on Aquatica, whose buildings are painted dark wherever the day's sun doesn't reach, nothing gets less than the night sky's own dim light, so its tall buildings stand as buildings and not as black shapes.
+
+  The light is worked out once, as the track loads, so it costs nothing while racing, and the headlights work as before. The game's own tracks are left as they are. `nightLamps=0` brings back the game's night; `nightScenery=0` leaves only the lamps.
+- **The chosen resolution no longer goes back to 640x480 or to 16-bit.** The game remembers the resolution as a place in its options list and makes that list anew every time it's needed, from what the renderer reports as free video memory at that moment. With every shape of resolution let in, and a 16 and a 32-bit version of each, the same place could come out as another mode the next time. The mod now decides the list itself, the same way every time: each resolution once, no memory test, and when the renderer offers more than the list's 20, 640x480 and the 19 largest. The resolution saved from last time is always looked up in that list.
+- **32-bit colour (`ws32bit=1`):** each resolution is listed in 32-bit colour where the renderer offers it. `ws32bit=0` lists 16-bit only. The menus keep the game's own 16-bit colour.
+- **Loading screen in 4:3 (`wsLoading=1`):** on a screen wider than 4:3 the loading picture, its text and its bar were stretched to the screen's width. They are now drawn in 4:3 in the middle.
+- **The log shows the display modes' real colour depth**, and which of the renderer's modes are listed in the options.
+- **Two logs for looking into things**, both off unless asked for (`[Advanced]` section):
+  - `nightLampsLog=1`: F10 (`nightLampsLogKey`) in a race writes the track as the game holds it at that moment to `HSFrameFix_scene.txt`: the camera, every vertex's colour before and after the lamps, every polygon near the camera;
+  - `hitchLog=1`: whenever a frame finds the simulation late, the second before it (every timer tick, simulation step and frame with its time) is written to `HSFrameFix_hitch.txt`. It tells a timer that woke late from a frame or a step that took long.
+- **Source:** split into parts under `src/`, each with a header for what the others use. `HSFrameFix.cpp` keeps the overview and the entry point. The build command now takes `HSFrameFix.cpp src/*.cpp`.
+
 ## 0.8.0: the unmodified official exe, portable install, no CD check, no disk space check
 
 - **The official exe, really unmodified:** the `nfshs.exe` inside EA's `NFSHSpatch4_50.exe` (SHA-1 `ac4f57ad3588161e0e0dd3ab582f7ad1f4d532eb`) is now the main supported exe.

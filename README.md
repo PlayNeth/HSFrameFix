@@ -64,7 +64,12 @@ Almost everything can be switched off or adjusted in `HSFrameFix.ini`.
 - **The 3D view is Hor+:** the 4:3 vertical view stays, and you see more at the sides.
 - **The HUD** keeps its 4:3 proportions, with its side elements anchored to the screen edges.
 - **Intro movies** are scaled like the menus.
-- **Resolutions** such as 1366×768 and 1920×1080 are listed in the options.
+- **The loading screen** keeps its 4:3 shape in the middle of the screen.
+- **Resolutions** such as 1366×768 and 1920×1080 are listed in the options, each once, in 32-bit colour where the renderer offers it. The one you choose stays chosen.
+
+### Night races
+
+- **The nine tracks from Need for Speed III are lit at night.** Hometown, Redrock Ridge, Atlantica, Rocky Pass, Country Woods, Lost Canyons, Aquatica, Summit and Empire City were pitch black outside the headlights. Their lamps, windows, lit signs and tunnel lights now light the road and what's around them. The game's own tracks are left as they are.
 
 ### Camera
 
@@ -100,7 +105,12 @@ Almost everything can be switched off or adjusted in `HSFrameFix.ini`.
 | `wsFixFOV` | `1` | The Hor+ 3D view. |
 | `wsHud` | `1` | `1` 4:3 HUD anchored to the screen edges, `2` 4:3 HUD in the middle, `0` the original (stretched). |
 | `wsMovies` | `1` | Scales intro movies like the menus. |
+| `wsLoading` | `1` | `1` loading screen 4:3 in the middle, `0` stretched to the screen's width. |
 | `wsUnlockResolutions` | `1` | Lists non-4:3 resolutions in the options. |
+| `ws32bit` | `1` | Lists each resolution in 32-bit colour where the renderer offers it; `0` = 16-bit. |
+| `nightLamps` | `1` | Night races on the Need for Speed III tracks: how bright their lamps light what's around them; `0` = the game's dark night. |
+| `nightLampReach` | `22` | How far a street lamp's light reaches, in metres. |
+| `nightScenery` | `1` | Night races on those tracks: light from windows, signs, tunnel lights and the like, the cities' street lighting, and the night sky's dim light on Aquatica; `0` = the lamps only. |
 | `closeExits` | `1` | Closing the window from outside ends the game. |
 | `noCDCheck` | `1` | The game doesn't ask for its CD at startup (the official 4.50 exe does). |
 | `portableInstall` | `1` | The game finds its files from the folder its exe is in. No registry entries are needed (without them the game says "files are corrupted; please re-install"), and the game folder can be copied or moved. Music and movies are read from the game folder if `Data\Audio\Music` and `Data\Movies` are there, else from the CD drive the registry names. |
@@ -123,6 +133,8 @@ All next to the `.asi`:
 |---|---|
 | `HSFrameFix.ini` | Settings. The mod also saves your FOV hotkey changes and your race resolution there. |
 | `HSFrameFix.log` | What the mod did; send it with any bug report. |
+| `HSFrameFix_scene.txt` | Only with `nightLampsLog=1`: the track as the game holds it, written when F10 is pressed in a race. |
+| `HSFrameFix_hitch.txt` | Only with `hitchLog=1`: the second leading up to each hitch. |
 
 ## Troubleshooting
 
@@ -135,11 +147,11 @@ All next to the `.asi`:
 
 ## Building from source
 
-The source is a single file, `HSFrameFix.cpp`, built with MinGW-w64, 32-bit:
+The source is `HSFrameFix.cpp` and the files under `src/`: one `.cpp` for each area of the mod, each with a header (`.h`) for what the other files use. It is built with MinGW-w64, 32-bit, from the repository's folder:
 
 ```
 i686-w64-mingw32-g++ -std=c++17 -O2 -shared -s -static-libgcc -static-libstdc++ \
-  -o HSFrameFix.asi HSFrameFix.cpp -lwinmm -luser32
+  -o HSFrameFix.asi HSFrameFix.cpp src/*.cpp -lwinmm -luser32
 ```
 
 ## License
